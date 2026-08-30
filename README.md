@@ -41,7 +41,7 @@ Update with `omarchy plugin update jharrison.sysmonitor`.
 | **GPU** | AMD: core and memory-controller utilisation, VRAM, power against cap, sclk/mclk, fan, and all three die temps (edge / junction / mem) |
 | **Disk** | Per-filesystem usage, deduplicated by device, plus NVMe health (temperature, wear, hours, error count) |
 | **Network** | Interface throughput and per-process traffic via bandwhich |
-| **Processes** | CPU, threads, runtime, memory; click for executable path, working directory and full ancestry; terminate, force-kill, renice, or open in `lsof` |
+| **Processes** | CPU, threads, runtime, memory; search by name or pid; click for executable path, working directory and full ancestry; terminate, force-kill, renice, or open in `lsof` |
 
 ## Keys
 
@@ -50,13 +50,21 @@ Update with `omarchy plugin update jharrison.sysmonitor`.
 | `j` / `k`, arrows | Move the cursor |
 | `h` / `l` | Previous / next section |
 | `1`–`9` | Jump to a section |
-| `Enter` | Process detail |
+| `/` | Search processes by name or pid |
+| `Enter` | Process detail (or, while searching, apply the filter) |
 | `x` | Terminate the selected process |
 | `s` | Sort by CPU or memory |
 | `p` | Pause the process list |
 | `r` | Refresh everything |
 | `PgUp` / `PgDn`, `Home` / `End` | Scroll |
-| `Esc` | Back, then close |
+| `Esc` | Back, then close (or, while searching, clear the filter) |
+
+Search matches the process name, its full command line (so `--flag value` style
+arguments count), and pid, all as substrings — and, unlike the plain process
+list, is never limited to the top `processCount` rows. That distinction is the
+point of the feature: a stuck or idle process (a game window that will not
+exit, holding ~0% CPU and memory) sorts to the bottom on every key and drops
+out of the capped view entirely, so search is what makes it findable again.
 
 ## A note on the CPU column
 

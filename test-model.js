@@ -281,6 +281,59 @@ check("mergeProcRows with a null map preserves existing readings (sort toggle)",
         var r = M.mergeProcRows(rows, null, "cpu", 2)
         return r[0].cpu === 9 && r[1].cpu === 5
       })())
+
+// ------------------------------------------------------------ process search
+check("mergeProcRows filter matches on command, case-insensitively",
+      (function() {
+        var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "steam", fullCommand: "steam" },
+                    { pid: 2, cpu: 1, cpuCore: 4, rss: 50, command: "bash", fullCommand: "bash" }]
+        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "STE")
+        return r.length === 1 && r[0].pid === 1
+      })())
+check("mergeProcRows filter also matches inside the full command line",
+      (function() {
+        var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "python3",
+                      fullCommand: "python3 /opt/game-launcher/run.py --fullscreen" },
+                    { pid: 2, cpu: 1, cpuCore: 4, rss: 50, command: "bash", fullCommand: "bash" }]
+        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "launcher")
+        return r.length === 1 && r[0].pid === 1
+      })())
+check("mergeProcRows filter matches by pid substring",
+      (function() {
+        var rows = [{ pid: 41234, cpu: 0, cpuCore: 0, rss: 10, command: "a", fullCommand: "a" },
+                    { pid: 99, cpu: 0, cpuCore: 0, rss: 10, command: "b", fullCommand: "b" }]
+        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "4123")
+        return r.length === 1 && r[0].pid === 41234
+      })())
+// This is the exact bug the search feature exists to fix: a stuck, idle
+// process ranks below the display limit on both sort keys and is invisible
+// in the plain top-N view, but must still be findable by name.
+check("mergeProcRows filter bypasses the row limit so a low-usage match still surfaces",
+      (function() {
+        var rows = [
+          { pid: 1, cpu: 90, cpuCore: 90, rss: 900, command: "hog-a", fullCommand: "hog-a" },
+          { pid: 2, cpu: 80, cpuCore: 80, rss: 800, command: "hog-b", fullCommand: "hog-b" },
+          { pid: 3, cpu: 70, cpuCore: 70, rss: 700, command: "hog-c", fullCommand: "hog-c" },
+          { pid: 4, cpu: 0, cpuCore: 0, rss: 5, command: "stuckgame", fullCommand: "stuckgame" }
+        ]
+        var unfiltered = M.mergeProcRows(rows, null, "cpu", 3)
+        var filtered = M.mergeProcRows(rows, null, "cpu", 3, null, 0, "stuck")
+        return unfiltered.every(function(r) { return r.pid !== 4 })   // hidden without a filter
+            && filtered.length === 1 && filtered[0].pid === 4          // found with one
+      })())
+check("mergeProcRows filter with no match returns an empty list, not the unfiltered set",
+      (function() {
+        var rows = [{ pid: 1, cpu: 0, cpuCore: 0, rss: 0, command: "a", fullCommand: "a" }]
+        return M.mergeProcRows(rows, null, "cpu", 8, null, 0, "nonexistent-xyz").length === 0
+      })())
+check("mergeProcRows with a blank filter behaves exactly like no filter",
+      (function() {
+        var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "a", fullCommand: "a" },
+                    { pid: 2, cpu: 9, cpuCore: 36, rss: 50, command: "b", fullCommand: "b" }]
+        var withBlank = M.mergeProcRows(rows, null, "cpu", 1, null, 0, "   ")
+        return withBlank.length === 1 && withBlank[0].pid === 2
+      })())
+
 check("parseProcDetailPs keeps a full command line with spaces",
       M.parseProcDetailPs("12 1 me 1.0 5.3 Sl 0 2048 /bin/app --flag a b").fullCommand
       === "/bin/app --flag a b")

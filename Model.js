@@ -595,7 +595,15 @@ function calcProcCpu(prevTicks, currTicks, dtSeconds, ncpu, clkTck) {
 // Merges computed CPU onto the metadata rows, sorts, and truncates.
 // Rows with no CPU reading yet (first poll, or newly started) sort last rather
 // than being dropped — a process that just appeared is still worth seeing.
-function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds) {
+//
+// filterText, when non-empty, matches command, the full command line, and pid
+// (all as case-insensitive substrings) and — this is the point of it —
+// REPLACES the truncation rather than narrowing it: every match comes back
+// regardless of limit. The limit is exactly what hides a process in the first
+// place, and the process worth searching for is usually the one with nothing
+// to earn it a place in the plain top-N view (a window that stopped
+// responding is idle, not busy).
+function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds, filterText) {
   var out = []
   for (var i = 0; i < (rows || []).length; i++) {
     var r = rows[i]
@@ -621,6 +629,15 @@ function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds) {
   out.sort(sortBy === "mem"
     ? function(a, b) { return (b.rss - a.rss) || (b.cpu - a.cpu) }
     : function(a, b) { return (b.cpu - a.cpu) || (b.rss - a.rss) })
+
+  var needle = String(filterText || "").trim().toLowerCase()
+  if (needle) {
+    return out.filter(function(r) {
+      var hay = (String(r.command || "") + " " + String(r.fullCommand || "")).toLowerCase()
+      return hay.indexOf(needle) >= 0 || String(r.pid).indexOf(needle) >= 0
+    })
+  }
+
   var n = limit > 0 ? limit : out.length
   return out.slice(0, n)
 }

@@ -149,6 +149,15 @@ Item {
   property real procTicksAt: 0
   property int cpuCount: 1
   property string processSortBy: "cpu"
+  // Non-empty while a search narrows the process list. Distinct from
+  // searchingProcesses (below): the filter text survives after the field
+  // closes, so "/" then Enter leaves the list filtered with the keyboard
+  // cursor free to move again.
+  property string processFilter: ""
+  // True only while the search field itself is open/focused — governs its
+  // visibility and, via PanelKeyCatcher's blocked property, whether typed
+  // characters go into the field instead of triggering shortcuts.
+  property bool searchingProcesses: false
   property var selectedProcess: null
   property int confirmKillPid: -1
   property string actionError: ""
@@ -299,6 +308,11 @@ Item {
     if (!proc) return
     actionError = ""
     confirmKillPid = -1
+    // A mouse click can land here while the search field is still open (it
+    // never had to pass through the field's own Enter handler). Clearing the
+    // flag here too means the keyboard is never left blocked behind a field
+    // that is no longer visible.
+    searchingProcesses = false
     selectedProcess = proc
     procDetail = null
     detailTick = 0
@@ -382,6 +396,36 @@ Item {
     processPaused = !processPaused
   }
 
+  // Opens the process search field and moves keyboard focus into it. A
+  // paused view is a frozen top-N slice — exactly what search exists to see
+  // past — so searching always resumes the live poll first.
+  function startProcessSearch() {
+    if (processPaused) togglePause()
+    searchingProcesses = true
+    cursorActive = true
+    focusSection = "processes"
+    followCursor()
+    Qt.callLater(function() {
+      if (procSearchField) { procSearchField.forceActiveFocus(); procSearchField.selectAll() }
+    })
+  }
+
+  // Enter in the field: stop editing but keep the filter applied, cursor on
+  // the best match, ready for x to kill it or j/k to look at the rest.
+  function commitProcessSearch() {
+    searchingProcesses = false
+    selectedIndex = 0
+    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+  }
+
+  // Escape in the field, or the clear button: drop the filter entirely.
+  function clearProcessSearch() {
+    processFilter = ""
+    searchingProcesses = false
+    selectedIndex = 0
+    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+  }
+
   function refreshAll() { tick = 0; runCollectors(true) }
 
   // Each section registers the item to scroll to when the cursor lands in it.
@@ -401,6 +445,20 @@ Item {
   onProcessSortByChanged: {
     if (processData.length > 0)
       processData = Model.mergeProcRows(processData, null, processSortBy, processCount)
+    start(procProc)
+  }
+
+  // Same instant-then-confirmed shape as the sort toggle above: re-filter
+  // whatever is already on screen so typing feels immediate, then force a
+  // fresh poll straight away. That second step matters here in a way it
+  // does not for sort — the rows on screen right now may still be the old
+  // capped top-N and simply not contain a match this filter would find, so
+  // a real snapshot has to land before the result is trustworthy.
+  onProcessFilterChanged: {
+    if (processData.length > 0)
+      processData = Model.mergeProcRows(processData, null, processSortBy, processCount,
+                                        null, 0, processFilter)
+    selectedIndex = 0
     start(procProc)
   }
 
@@ -689,7 +747,7 @@ Item {
                                            dt, root.cpuCount, 100)
           root.processData = Model.mergeProcRows(snap.rows, cpuByPid,
                                                  root.processSortBy, root.processCount,
-                                                 snap.meta, root.uptimeSeconds)
+                                                 snap.meta, root.uptimeSeconds, root.processFilter)
           root.clampCursor()
         }
         root.procTicksPrev = snap.ticks
@@ -867,6 +925,10 @@ Item {
       PanelKeyCatcher {
         id: keyCatcher
         anchors.fill: parent
+        // The process search field is the one inline editor this panel has.
+        // While it is open, typed characters must reach it rather than
+        // firing the r/s/p/1-9 shortcuts below.
+        blocked: root.searchingProcesses
 
         onMoveRequested: function(dx, dy) {
           if (!root.cursorActive) { root.cursorActive = true; if (dy >= 0) return }
@@ -892,6 +954,7 @@ Item {
           else if (t === "s" || t === "S")
             root.processSortBy = root.processSortBy === "cpu" ? "mem" : "cpu"
           else if (t === "p" || t === "P") root.togglePause()
+          else if (t === "/") root.startProcessSearch()
           else if (t >= "1" && t <= "9") { root.jumpToSection(parseInt(t, 10)); root.followCursor() }
         }
 
@@ -1681,7 +1744,11 @@ Item {
                   id: procHdr
                   anchors.left: parent.left
                   anchors.verticalCenter: parent.verticalCenter
-                  text: root.processPaused ? "PROCESSES — PAUSED" : "PROCESSES"
+                  text: (root.processPaused ? "PROCESSES — PAUSED" : "PROCESSES")
+                        + (root.processFilter !== ""
+                           ? " (" + root.processView.length
+                             + (root.processView.length === 1 ? " MATCH)" : " MATCHES)")
+                           : "")
                   Component.onCompleted: root.registerAnchor("processes", this)
                   foreground: root.accent
                   fontFamily: root.fontFamily
@@ -1712,6 +1779,66 @@ Item {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   onClicked: root.processSortBy = root.processSortBy === "cpu" ? "mem" : "cpu"
+                }
+
+                // Idle-state flags in accent the same way pauseBtn does, so a
+                // filter left applied after Enter stays visible even once the
+                // field itself has closed.
+                PanelActionButton {
+                  id: searchBtn
+                  anchors.right: sortBtn.left
+                  anchors.rightMargin: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "󰍉"
+                  tooltipText: root.processFilter !== ""
+                               ? "Filtering “" + root.processFilter + "” — click to edit (/)"
+                               : "Search processes by name or pid (/)"
+                  foreground: root.processFilter !== "" ? root.accent : root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.startProcessSearch()
+                }
+              }
+
+              // Full-width search strip, shown only while editing — narrow
+              // window widths have no room to share this row with the title
+              // and buttons above, so it gets one of its own instead.
+              Item {
+                id: procSearchRow
+                width: parent.width
+                implicitHeight: procSearchField.implicitHeight
+                visible: root.searchingProcesses
+
+                TextField {
+                  id: procSearchField
+                  anchors.left: parent.left
+                  anchors.right: clearSearchBtn.left
+                  anchors.rightMargin: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "Search processes by name or pid…"
+                  foreground: root.foreground
+                  text: root.processFilter
+                  onTextChanged: root.processFilter = text
+
+                  Keys.onPressed: function(event) {
+                    if (event.key === Qt.Key_Escape) {
+                      root.clearProcessSearch()
+                      event.accepted = true
+                    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                      root.commitProcessSearch()
+                      event.accepted = true
+                    }
+                  }
+                }
+
+                PanelActionButton {
+                  id: clearSearchBtn
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "󰜺"
+                  tooltipText: "Clear search (esc)"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.clearProcessSearch()
                 }
               }
 
@@ -1848,7 +1975,7 @@ Item {
             anchors.centerIn: parent
             width: parent.width - Style.space(32)
             horizontalAlignment: Text.AlignHCenter
-            text: "j/k move    h/l section    1-9 jump    enter detail    "
+            text: "j/k move    h/l section    1-9 jump    / search    enter detail    "
                   + "x kill    s sort    p pause    r refresh    PgUp/PgDn scroll    esc close"
             color: root.dimmer
             font.family: root.fontFamily
