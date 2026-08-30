@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "jharrison.sysmonitor",
+  "name": "System Monitor",
+  "version": "2.0.0",
+  "author": "jharrison",
+  "description": "CPU, memory, GPU, disk, network, process, and temperature monitoring panel",
+  "kinds": ["panel"],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  },
+  "panel": {
+    "displayName": "System Monitor",
+    "description": "CPU, memory, GPU, disk, network, processes, and temperatures",
+    "defaults": {
+      "pollInterval": 2000,
+      "showCpuPerCore": true,
+      "showSmartHealth": true,
+      "showBandwhich": true,
+      "processCount": 14,
+      "showAllSensors": false,
+      "fontScale": 1.25
+    }
+  }
+}
