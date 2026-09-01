@@ -32,6 +32,18 @@ o.window({ tag = "sysmonitor-window" }, { opacity = "1 1" })
 
 Update with `omarchy plugin update jharrison.sysmonitor`.
 
+## Uninstall
+
+```bash
+omarchy plugin remove jharrison.sysmonitor
+```
+
+This unregisters the plugin and stops the shell from loading it. The keybinding in
+`bindings.lua` and the window rules in `hyprland.lua` from Install are just a few lines you
+added by hand — removing the plugin does not touch either file. Leaving them in place is
+harmless (the panel's window class simply never appears again), but delete them too for a
+clean config.
+
 ## What it shows
 
 | Section | Detail |
