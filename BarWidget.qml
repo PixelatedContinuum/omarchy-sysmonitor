@@ -44,19 +44,20 @@ BarWidget {
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color hotColor: bar ? bar.urgent : Color.urgent
 
-  // Symmetric edge margin, not just a gap on whichever side happened to
-  // need one on this machine. WidgetButton (the base every plain first-
-  // party bar widget builds on) reserves 8.5 on each side by default,
-  // which is why two ordinary icons never touch — this widget bypasses
-  // WidgetButton for its multi-segment layout, so without this it would
-  // rely entirely on whatever the *next* plugin over happens to reserve.
-  // A published plugin can't assume what will sit on either side of it,
-  // or which side that even is once someone reorders the bar or moves it
-  // to a vertical edge, so both sides get the same margin unconditionally.
-  readonly property real edgeMargin: Style.spaceReal(8.5)
+  // The native bar cluster this sits next to (Indicators, the workspace
+  // numbers) spaces its own icons with `spacing: 0` on its Row — checked
+  // directly in Indicators.qml, not assumed. The visible gap between two
+  // of its icons comes entirely from each individual WidgetButton's own
+  // 8.5 horizontalMargin (its default), one icon's right margin plus the
+  // next one's left margin. So the native rhythm isn't "some spacing value
+  // on the container" at all — it's "every icon carries its own margin,
+  // and the container contributes nothing." segMargin reproduces that
+  // exactly, applied to each Segment below, rather than one number chosen
+  // by eye that happens to land close to it.
+  readonly property real segMargin: Style.spaceReal(8.5)
 
   visible: panelLoader.item !== null
-  implicitWidth: row.implicitWidth + edgeMargin * 2
+  implicitWidth: row.implicitWidth
   implicitHeight: row.implicitHeight
 
   onBarChanged: injectPanel()
@@ -91,9 +92,8 @@ BarWidget {
 
   Row {
     id: row
-    x: root.edgeMargin
     anchors.verticalCenter: parent.verticalCenter
-    spacing: Style.space(18)
+    spacing: 0
 
     Segment { text: root.cpuGlyph + " " + (root.quick ? root.quick.cpuBarText : "…"); hot: root.quick && root.quick.cpuTotalPercent >= 90 }
     Segment { visible: root.quick && root.quick.gpuPath !== ""; text: root.gpuGlyph + " " + (root.quick ? root.quick.gpuBarText : "") }
@@ -116,9 +116,15 @@ BarWidget {
 
   // One bar segment: plain text, no per-segment click (the whole row shares
   // one MouseArea above and opens the one dropdown — there are no tabs to
-  // route to, unlike Quadrant's per-segment click-through).
+  // route to, unlike Quadrant's per-segment click-through). leftPadding/
+  // rightPadding — not Row.spacing — is what gives two adjacent segments
+  // their gap, matching the native mechanism (see segMargin above). The
+  // same padding on the first and last segment doubles as the widget's own
+  // outer edge margin, so there is nothing separate to reserve for that.
   component Segment: Text {
     property bool hot: false
+    leftPadding: root.segMargin
+    rightPadding: root.segMargin
     font.family: Style.font.family
     font.pixelSize: Style.bar.iconFont
     color: hot ? root.hotColor : root.foreground
