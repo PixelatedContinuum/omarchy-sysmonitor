@@ -66,10 +66,31 @@ Panel {
   property var netRates: null   // { rxRate, txRate } for primaryIface, once primed
 
   // ---- top processes (same COLLECT_PROC_SNAPSHOT pipeline the full panel's
-  // process list uses, limited to 4 rows) ----
+  // process list uses, limited to 4 rows each). Both lists are drawn from the
+  // same snapshot — the cpu-sorted call merges the live cpuByPid map onto
+  // snap.rows in place, and the mem-sorted call re-sorts those same
+  // (already-merged) row objects with a null map ("re-sort what's here" —
+  // see mergeProcRows), so memory sorting never recomputes or duplicates the
+  // CPU delta work. ----
   property var procTicksPrev: null
   property real procTicksAt: 0
-  property var topProcesses: []
+  property var topProcessesCpu: []
+  property var topProcessesMem: []
+
+  // ---- animated headline values. Each eases toward the true polled number
+  // instead of snapping on every 2-second tick — the meter bars below read
+  // as gauges settling rather than a number flickering, which is the point:
+  // motion should communicate "this is live," not just decorate the numbers. ----
+  property real animCpu: cpuTotalPercent
+  property real animGpu: gpuUtil
+  property real animMem: memPercent
+  property real animDisk: diskPercent
+  property real animTemp: cpuTempC
+  Behavior on animCpu { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
+  Behavior on animGpu { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
+  Behavior on animMem { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
+  Behavior on animDisk { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
+  Behavior on animTemp { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
 
   // ---- per-segment bar text, read directly by BarWidget.qml ----
   readonly property string cpuBarText: cpuPrimed ? Math.round(cpuTotalPercent) + "%" : "…"
@@ -242,7 +263,8 @@ Panel {
         if (root.procTicksPrev && root.procTicksAt > 0) {
           var dt = (now - root.procTicksAt) / 1000
           var cpuByPid = Model.calcProcCpu(root.procTicksPrev, snap.ticks, dt, root.cpuCount, 100)
-          root.topProcesses = Model.mergeProcRows(snap.rows, cpuByPid, "cpu", 4)
+          root.topProcessesCpu = Model.mergeProcRows(snap.rows, cpuByPid, "cpu", 4)
+          root.topProcessesMem = Model.mergeProcRows(snap.rows, null, "mem", 4)
         }
         root.procTicksPrev = snap.ticks
         root.procTicksAt = now
@@ -283,18 +305,38 @@ Panel {
 
         GridLayout {
           Layout.fillWidth: true
-          columns: 3
-          rowSpacing: Style.space(10)
-          columnSpacing: Style.space(14)
+          columns: 2
+          rowSpacing: Style.space(12)
+          columnSpacing: Style.space(18)
 
-          QuickStat { label: "CPU"; value: root.cpuPrimed ? Math.round(root.cpuTotalPercent) + "%" : "…" }
-          QuickStat { visible: root.gpuPath !== ""; label: "GPU"; value: Math.round(root.gpuUtil) + "%" }
-          QuickStat { label: "MEM"; value: root.memInfo ? Math.round(root.memPercent) + "%" : "…" }
-          QuickStat { label: "TEMP"; value: root.cpuTempC > 0 ? Math.round(root.cpuTempC) + "°C" : "…" }
-          QuickStat { label: "DISK"; value: Math.round(root.diskPercent) + "%" }
+          QuickStat {
+            label: "CPU"; fraction: root.animCpu / 100; hot: root.cpuTotalPercent >= 90
+            valueText: root.cpuPrimed ? Math.round(root.animCpu) + "%" : "…"
+          }
+          QuickStat {
+            visible: root.gpuPath !== ""
+            label: "GPU"; fraction: root.animGpu / 100; hot: root.gpuUtil >= 90
+            valueText: Math.round(root.animGpu) + "%"
+          }
+          QuickStat {
+            label: "MEM"; fraction: root.animMem / 100; hot: root.memPercent >= 90
+            valueText: root.memInfo ? Math.round(root.animMem) + "%" : "…"
+          }
+          QuickStat {
+            label: "DISK"; fraction: root.animDisk / 100; hot: root.diskPercent >= 90
+            valueText: Math.round(root.animDisk) + "%"
+          }
+          // No natural 0-1 scale for temperature or an open-ended network
+          // rate, so these two skip the meter bar rather than force one onto
+          // an arbitrary cap that would quietly mislead — the animated
+          // number still carries the "this is live" motion on its own.
+          QuickStat {
+            label: "TEMP"; hot: root.cpuTempC >= 85
+            valueText: root.cpuTempC > 0 ? Math.round(root.animTemp) + "°C" : "…"
+          }
           QuickStat {
             label: "NET"
-            value: root.netRates
+            valueText: root.netRates
               ? "↑" + root._compactRate(root.netRates.txRate) + " ↓" + root._compactRate(root.netRates.rxRate)
               : "…"
           }
@@ -307,48 +349,29 @@ Panel {
           opacity: 0.4
         }
 
-        Text {
-          text: "TOP PROCESSES"
-          color: Color.muted
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
+        ProcessSection {
+          title: "TOP PROCESSES — CPU"
+          rows: root.topProcessesCpu
+          valueFor: function(p) { return p.cpu === undefined ? "new" : Math.round(p.cpu) + "%" }
         }
 
-        ColumnLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(4)
-          visible: root.topProcesses.length > 0
-
-          Repeater {
-            model: root.topProcesses
-            delegate: RowLayout {
-              Layout.fillWidth: true
-              Text {
-                Layout.fillWidth: true
-                text: modelData.command || ""
-                color: Color.foreground
-                elide: Text.ElideRight
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-              Text {
-                text: modelData.cpu === undefined ? "new" : Math.round(modelData.cpu) + "%"
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-            }
-          }
+        ProcessSection {
+          title: "TOP PROCESSES — MEMORY"
+          rows: root.topProcessesMem
+          valueFor: function(p) { return Model.formatBytes(p.rss) }
         }
 
         Text {
+          id: openLink
           Layout.fillWidth: true
           Layout.topMargin: Style.space(4)
           text: "Open full monitor →"
-          color: Color.accent
+          color: openLinkHover.hovered ? Color.foreground : Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
+          Behavior on color { ColorAnimation { duration: 120 } }
 
+          HoverHandler { id: openLinkHover }
           MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
@@ -362,26 +385,144 @@ Panel {
     }
   }
 
-  // One stat cell: a small caption label over a larger value. Local to this
-  // file — the full panel has its own similarly-named `Stat` component in
-  // Panel.qml, but the two files load independently (separate kinds), so
-  // there is no collision and no shared-component extraction to do here.
+  // One stat cell: caption label, animated value, and — where a stat has a
+  // natural 0-1 scale — a slim meter bar beneath it (fraction < 0 hides the
+  // bar entirely; see the GridLayout above for which stats get one). Local
+  // to this file — the full panel has its own similarly-named `Stat`
+  // component in Panel.qml, but the two files load independently (separate
+  // kinds), so there is no collision and no shared-component extraction to
+  // do here.
   component QuickStat: ColumnLayout {
+    id: stat
     property string label: ""
-    property string value: ""
-    spacing: 0
+    property string valueText: ""
+    property real fraction: -1
+    property bool hot: false
+    spacing: Style.space(2)
+    Layout.fillWidth: true
 
     Text {
-      text: parent.label
+      text: stat.label
       color: Color.muted
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
     }
     Text {
-      text: parent.value
-      color: Color.foreground
+      text: stat.valueText
+      color: stat.hot ? Color.urgent : Color.foreground
       font.family: Style.font.family
       font.pixelSize: Style.font.body
+      Behavior on color { ColorAnimation { duration: 200 } }
+    }
+    MeterBar {
+      Layout.fillWidth: true
+      visible: stat.fraction >= 0
+      value: stat.fraction
+      warn: stat.hot
+    }
+  }
+
+  // Slim animated meter: a rounded track plus a fill that eases to its new
+  // width instead of snapping, the same pattern (down to the easing curve)
+  // as the full panel's own MeterBar in Panel.qml — kept as a separate local
+  // copy rather than a shared import for the same reason QuickStat is:
+  // panel and bar-widget kinds are two independent QML component trees, so
+  // there is nothing to actually share, only a look worth matching.
+  component MeterBar: Item {
+    id: mb
+    property real value: 0
+    property bool warn: false
+    implicitHeight: Style.space(5)
+    height: implicitHeight
+
+    Rectangle {
+      anchors.fill: parent
+      radius: height / 2
+      color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.15)
+
+      Rectangle {
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: parent.width * Math.max(0, Math.min(1, mb.value))
+        radius: parent.radius
+        color: mb.warn ? Color.urgent : Color.accent
+        Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutQuad } }
+      }
+    }
+  }
+
+  // One labelled block of process rows — the CPU and memory sections are
+  // identical in shape and differ only in which rows they're handed and how
+  // the trailing value is computed, so both go through this rather than two
+  // copies of the same Repeater.
+  component ProcessSection: ColumnLayout {
+    id: psec
+    property string title: ""
+    property var rows: []
+    property var valueFor: function(p) { return "" }
+    Layout.fillWidth: true
+    spacing: Style.space(4)
+    visible: psec.rows.length > 0
+
+    Text {
+      text: psec.title
+      color: Color.muted
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Repeater {
+      model: psec.rows
+      delegate: ProcessRow {
+        Layout.fillWidth: true
+        commandText: modelData.command || ""
+        // A Repeater's delegates are reparented to the Repeater's OWN
+        // parent, not the Repeater itself, so a bare `parent` here already
+        // means psec — explicit id, not a parent-chain guess, on purpose
+        // after getting exactly that wrong once already in this file.
+        valueText: psec.valueFor(modelData)
+      }
+    }
+  }
+
+  // One process row: command name, trailing value, and a hover highlight —
+  // a small "this is interactive-feeling, not a static label" touch even
+  // though clicking a row does nothing yet (the full panel is where a
+  // process actually gets acted on).
+  component ProcessRow: Rectangle {
+    id: pr
+    property string commandText: ""
+    property string valueText: ""
+    implicitHeight: prRow.implicitHeight + Style.space(4)
+    radius: Style.cornerRadius
+    color: prHover.hovered ? Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08) : "transparent"
+    Behavior on color { ColorAnimation { duration: 120 } }
+
+    HoverHandler { id: prHover }
+
+    RowLayout {
+      id: prRow
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(4)
+      anchors.rightMargin: Style.space(4)
+
+      Text {
+        Layout.fillWidth: true
+        text: pr.commandText
+        color: Color.foreground
+        elide: Text.ElideRight
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        text: pr.valueText
+        color: Color.muted
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
     }
   }
 }
