@@ -211,9 +211,20 @@ var hz = parseInt(sh("getconf CLK_TCK") || "100", 10)
 var snapA = M.parseProcSnapshot(sh(M.COLLECT_PROC_SNAPSHOT))
 check("snapshot returns a tick table", Object.keys(snapA.ticks).length > 10,
       Object.keys(snapA.ticks).length + " pids")
-check("snapshot returns metadata rows", snapA.rows.length > 10,
+check("snapshot returns ps-derived rows", snapA.rows.length > 10,
       snapA.rows.length + " rows")
 check("tick table covers pid 1", snapA.ticks[1] !== undefined)
+// Threads/elapsed used to come from a second, separate /proc scan keyed by
+// pid — a process could appear in the ps rows and miss that scan entirely if
+// it was born or reaped in the gap between the two. They are read off the
+// same ps line as state/mem/rss now, so every row has them unconditionally.
+check("rows carry thread count straight from ps, not a separate /proc pass",
+      snapA.rows.every(function(r) { return r.threads > 0 }),
+      snapA.rows.slice(0, 3).map(function(r) { return r.command + ":" + r.threads }).join(" "))
+check("rows carry elapsed time straight from ps",
+      snapA.rows.every(function(r) { return r.elapsed >= 0 }))
+check("a freshly parsed row has no CPU reading yet — undefined, not a misleading 0",
+      snapA.rows.every(function(r) { return r.cpu === undefined && r.cpuCore === undefined }))
 
 var tA = Date.now()
 var spin2 = Date.now(); while (Date.now() - spin2 < 600) {}
@@ -233,28 +244,37 @@ check("total machine share across all pids stays under 100%",
 
 var merged = M.mergeProcRows(snapB.rows, cpuMap, "cpu", 8)
 check("merge returns the requested row count", merged.length === 8)
+check("thread counts are positive", merged.every(function(r) { return r.threads > 0 }),
+      merged.slice(0, 3).map(function(r) { return r.command + ":" + r.threads }).join(" "))
 
 var up = parseFloat((read("/proc/uptime") || "0").split(" ")[0])
-var withMeta = M.mergeProcRows(snapB.rows, cpuMap, "cpu", 8, snapB.meta, up)
-check("snapshot carries thread counts", Object.keys(snapB.meta).length > 10)
-check("thread counts are positive", withMeta.every(function(r) { return r.threads > 0 }),
-      withMeta.slice(0, 3).map(function(r) { return r.command + ":" + r.threads }).join(" "))
 check("elapsed never exceeds system uptime",
-      withMeta.every(function(r) { return r.elapsed >= 0 && r.elapsed <= up + 1 }))
+      merged.every(function(r) { return r.elapsed >= 0 && r.elapsed <= up + 1 }))
 check("thread count agrees with ps for the top process", (function() {
-  var t = parseInt((sh("ps -o nlwp= -p " + withMeta[0].pid) || "0").trim(), 10)
-  return t === withMeta[0].threads
-})(), "pid " + withMeta[0].pid)
+  var t = parseInt((sh("ps -o nlwp= -p " + merged[0].pid) || "0").trim(), 10)
+  return t === merged[0].threads
+})(), "pid " + merged[0].pid)
 check("elapsed agrees with ps etimes for the top process (within 2s)", (function() {
-  var e = parseInt((sh("ps -o etimes= -p " + withMeta[0].pid) || "-1").trim(), 10)
-  return e >= 0 && Math.abs(e - withMeta[0].elapsed) <= 2
-})(), "pid " + withMeta[0].pid)
+  var e = parseInt((sh("ps -o etimes= -p " + merged[0].pid) || "-1").trim(), 10)
+  return e >= 0 && Math.abs(e - merged[0].elapsed) <= 2
+})(), "pid " + merged[0].pid)
 check("merged rows are sorted by CPU descending",
-      merged.every(function(r, i) { return i === 0 || merged[i - 1].cpu >= r.cpu }))
+      merged.every(function(r, i) { return i === 0 || M.cpuSortValue(merged[i - 1]) >= M.cpuSortValue(r) }))
 check("sorting by mem reorders by RSS", (function() {
   var m = M.mergeProcRows(snapB.rows, cpuMap, "mem", 8)
   return m.every(function(r, i) { return i === 0 || m[i - 1].rss >= r.rss })
 })())
+// This is the fix itself: a process born after the tick snapshot has no
+// cpuByPid entry at all. It must not tie with, let alone rank above, a
+// process actually confirmed idle at 0.0% — that would be the exact "looks
+// broken" signature (search "claude", see rows with no CPU reading dressed
+// up as a flat 0%) this was built to remove.
+check("a pid with no CPU reading sorts behind a confirmed-idle 0.0%, not level with it",
+      (function() {
+        var rows = [{ pid: 1, cpu: undefined, cpuCore: undefined, rss: 900 },
+                    { pid: 2, cpu: 0, cpuCore: 0, rss: 10 }]
+        return M.mergeProcRows(rows, null, "cpu", 2).map(function(r) { return r.pid }).join(",") === "2,1"
+      })())
 
 check("equal-CPU rows break the tie on memory, not arbitrarily",
       (function() {
@@ -281,13 +301,19 @@ check("mergeProcRows with a null map preserves existing readings (sort toggle)",
         var r = M.mergeProcRows(rows, null, "cpu", 2)
         return r[0].cpu === 9 && r[1].cpu === 5
       })())
+check("mergeProcRows assigns undefined, not 0, for a pid missing from a fresh cpuByPid map",
+      (function() {
+        var rows = [{ pid: 1, rss: 10 }]
+        var r = M.mergeProcRows(rows, {}, "cpu", 1)
+        return r[0].cpu === undefined && r[0].cpuCore === undefined
+      })())
 
 // ------------------------------------------------------------ process search
 check("mergeProcRows filter matches on command, case-insensitively",
       (function() {
         var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "steam", fullCommand: "steam" },
                     { pid: 2, cpu: 1, cpuCore: 4, rss: 50, command: "bash", fullCommand: "bash" }]
-        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "STE")
+        var r = M.mergeProcRows(rows, null, "cpu", 8, "STE")
         return r.length === 1 && r[0].pid === 1
       })())
 check("mergeProcRows filter also matches inside the full command line",
@@ -295,14 +321,14 @@ check("mergeProcRows filter also matches inside the full command line",
         var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "python3",
                       fullCommand: "python3 /opt/game-launcher/run.py --fullscreen" },
                     { pid: 2, cpu: 1, cpuCore: 4, rss: 50, command: "bash", fullCommand: "bash" }]
-        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "launcher")
+        var r = M.mergeProcRows(rows, null, "cpu", 8, "launcher")
         return r.length === 1 && r[0].pid === 1
       })())
 check("mergeProcRows filter matches by pid substring",
       (function() {
         var rows = [{ pid: 41234, cpu: 0, cpuCore: 0, rss: 10, command: "a", fullCommand: "a" },
                     { pid: 99, cpu: 0, cpuCore: 0, rss: 10, command: "b", fullCommand: "b" }]
-        var r = M.mergeProcRows(rows, null, "cpu", 8, null, 0, "4123")
+        var r = M.mergeProcRows(rows, null, "cpu", 8, "4123")
         return r.length === 1 && r[0].pid === 41234
       })())
 // This is the exact bug the search feature exists to fix: a stuck, idle
@@ -317,20 +343,20 @@ check("mergeProcRows filter bypasses the row limit so a low-usage match still su
           { pid: 4, cpu: 0, cpuCore: 0, rss: 5, command: "stuckgame", fullCommand: "stuckgame" }
         ]
         var unfiltered = M.mergeProcRows(rows, null, "cpu", 3)
-        var filtered = M.mergeProcRows(rows, null, "cpu", 3, null, 0, "stuck")
+        var filtered = M.mergeProcRows(rows, null, "cpu", 3, "stuck")
         return unfiltered.every(function(r) { return r.pid !== 4 })   // hidden without a filter
             && filtered.length === 1 && filtered[0].pid === 4          // found with one
       })())
 check("mergeProcRows filter with no match returns an empty list, not the unfiltered set",
       (function() {
         var rows = [{ pid: 1, cpu: 0, cpuCore: 0, rss: 0, command: "a", fullCommand: "a" }]
-        return M.mergeProcRows(rows, null, "cpu", 8, null, 0, "nonexistent-xyz").length === 0
+        return M.mergeProcRows(rows, null, "cpu", 8, "nonexistent-xyz").length === 0
       })())
 check("mergeProcRows with a blank filter behaves exactly like no filter",
       (function() {
         var rows = [{ pid: 1, cpu: 5, cpuCore: 20, rss: 100, command: "a", fullCommand: "a" },
                     { pid: 2, cpu: 9, cpuCore: 36, rss: 50, command: "b", fullCommand: "b" }]
-        var withBlank = M.mergeProcRows(rows, null, "cpu", 1, null, 0, "   ")
+        var withBlank = M.mergeProcRows(rows, null, "cpu", 1, "   ")
         return withBlank.length === 1 && withBlank[0].pid === 2
       })())
 
@@ -342,7 +368,19 @@ check("parseProcDetailPs parses the fixed fields",
         return r.pid === 12 && r.ppid === 1 && r.user === "me" && r.rss === 2048 * 1024 })())
 check("parseProcDetailPs rejects a short row", M.parseProcDetailPs("12 1 me") === null)
 check("parseNoCpuPsLine keeps a command containing spaces",
-      M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 my app").command === "my app")
+      M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 4 120 my app").command === "my app")
+check("parseNoCpuPsLine reads thread count and elapsed time off the same ps line",
+      (function() {
+        var r = M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 4 120 my app")
+        return r.threads === 4 && r.elapsed === 120
+      })())
+check("parseNoCpuPsLine starts cpu/cpuCore undefined, not 0 — nothing has measured this row yet",
+      (function() {
+        var r = M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 4 120 app")
+        return r.cpu === undefined && r.cpuCore === undefined
+      })())
+check("parseNoCpuPsLine rejects a row missing nlwp/etimes",
+      M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 app") === null)
 
 // ------------------------------------------------------------------ SMART
 section("SMART — live smartctl")

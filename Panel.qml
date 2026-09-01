@@ -457,7 +457,7 @@ Item {
   onProcessFilterChanged: {
     if (processData.length > 0)
       processData = Model.mergeProcRows(processData, null, processSortBy, processCount,
-                                        null, 0, processFilter)
+                                        processFilter)
     selectedIndex = 0
     start(procProc)
   }
@@ -747,7 +747,7 @@ Item {
                                            dt, root.cpuCount, 100)
           root.processData = Model.mergeProcRows(snap.rows, cpuByPid,
                                                  root.processSortBy, root.processCount,
-                                                 snap.meta, root.uptimeSeconds, root.processFilter)
+                                                 root.processFilter)
           root.clampCursor()
         }
         root.procTicksPrev = snap.ticks
@@ -1161,10 +1161,12 @@ Item {
                 DetailLabel { text: "CPU" }
                 DetailValue {
                   text: root.selectedProcess
-                        ? root.selectedProcess.cpu.toFixed(1) + "% of "
-                          + root.cpuCount + " threads   ("
-                          + (root.selectedProcess.cpuCore || 0).toFixed(0)
-                          + "% of one core)"
+                        ? (root.selectedProcess.cpu !== undefined
+                           ? root.selectedProcess.cpu.toFixed(1) + "% of "
+                             + root.cpuCount + " threads   ("
+                             + (root.selectedProcess.cpuCore || 0).toFixed(0)
+                             + "% of one core)"
+                           : "not measured yet (process appeared since the last poll)")
                         : ""
                 }
                 DetailLabel { text: "Memory" }
@@ -2082,8 +2084,10 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       width: root.colCpu
       horizontalAlignment: Text.AlignRight
-      text: pr.proc ? pr.proc.cpu.toFixed(1) + "%" : ""
-      color: pr.proc && pr.proc.cpu >= 25 ? root.urgent : root.foreground
+      text: pr.proc
+            ? (pr.proc.cpu !== undefined ? pr.proc.cpu.toFixed(1) + "%" : "new")
+            : ""
+      color: pr.proc && pr.proc.cpu !== undefined && pr.proc.cpu >= 25 ? root.urgent : root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
     }
     Text {

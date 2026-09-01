@@ -142,20 +142,31 @@ function collectProcDetail(pid) {
 //
 // So CPU% is computed here the way btop does it — utime+stime deltas between
 // polls — and normalised against all cores, so the column sums toward the
-// headline number instead of contradicting it.
+// headline number instead of contradicting it. That delta is the one thing
+// `ps` cannot give at tick resolution, so it is still read straight from
+// /proc/PID/stat.
+//
+// Thread count and elapsed time used to ride along on that same /proc read
+// (num_threads and starttime were two more fields in the line below). They
+// no longer do: this command is really two independent snapshots of the
+// process table — the awk pass and the ps pass — taken microseconds apart,
+// not atomically, and a process born or reaped in that gap lands in one and
+// not the other. For CPU that is unavoidable (nothing else supplies tick
+// deltas), but for threads/elapsed there is no need to accept the same race:
+// `ps` reports both directly (`nlwp`, `etimes`), so they now come from the
+// SAME invocation as state/mem/rss/comm below, closing the gap for those two
+// fields entirely. See parseNoCpuPsLine.
 //
 // Field 2 of /proc/PID/stat is the command in parens and may itself contain
 // spaces or parens, so everything is indexed after the LAST ") " rather than
 // by naive whitespace splitting. Once the pid and comm are behind us, original
-// field N is f[N-2]: utime 14→f[12], stime 15→f[13], num_threads 20→f[18],
-// starttime 22→f[20]. Thread count and start time ride along free — the file
-// is already open.
+// field N is f[N-2]: utime 14→f[12], stime 15→f[13].
 var COLLECT_PROC_SNAPSHOT =
   "awk '{ n=index($0, \") \"); if (n == 0) next; " +
        "rest = substr($0, n + 2); split(rest, f, \" \"); " +
-       "print $1, f[12], f[13], f[18], f[20] }' /proc/[0-9]*/stat 2>/dev/null; " +
+       "print $1, f[12], f[13] }' /proc/[0-9]*/stat 2>/dev/null; " +
   "echo '@@PS'; " +
-  "ps -eo pid,ppid,user:20,%mem,stat,nice,rss,comm --no-headers 2>/dev/null"
+  "ps -eo pid,ppid,user:20,%mem,stat,nice,rss,nlwp,etimes,comm --no-headers 2>/dev/null"
 
 // ---------------------------------------------------------------- helpers
 
@@ -495,8 +506,6 @@ function formatState(stat) {
   return flags.length ? base + " (" + flags.join(", ") + ")" : base
 }
 
-// Splits COLLECT_PROC_SNAPSHOT into the tick table and the metadata rows.
-// → { ticks: { pid: utime+stime }, rows: [ …parsePsLine without cpu… ] }
 // Detail-view `ps` row: every field is fixed-width except `args`, which is
 // last and takes the remainder.
 //
@@ -522,8 +531,13 @@ function parseProcDetailPs(line) {
   }
 }
 
+// Splits COLLECT_PROC_SNAPSHOT into the tick table and the ps-derived rows.
+// → { ticks: { pid: utime+stime }, rows: [ …parseNoCpuPsLine… ] }
+// Thread count and elapsed time travel on the rows themselves now, not a
+// separate meta table keyed off the /proc scan — see the comment above
+// COLLECT_PROC_SNAPSHOT for why that used to race.
 function parseProcSnapshot(raw) {
-  var out = { ticks: {}, meta: {}, rows: [] }
+  var out = { ticks: {}, rows: [] }
   var parts = String(raw || "").split("@@PS")
   var lines = _lines(parts[0])
   for (var i = 0; i < lines.length; i++) {
@@ -532,7 +546,6 @@ function parseProcSnapshot(raw) {
     var pid = _int(f[0])
     if (pid <= 0) continue
     out.ticks[pid] = _int(f[1]) + _int(f[2])
-    out.meta[pid] = { threads: _int(f[3]), startTicks: _int(f[4]) }
   }
   if (parts.length > 1) {
     var rows = _lines(parts[1])
@@ -544,13 +557,21 @@ function parseProcSnapshot(raw) {
   return out
 }
 
-// `ps -eo pid,ppid,user:20,%mem,stat,nice,rss,comm` — same as parsePsLine but
-// without the %cpu column, which now comes from the tick deltas instead.
+// `ps -eo pid,ppid,user:20,%mem,stat,nice,rss,nlwp,etimes,comm` — same as
+// parsePsLine but without %cpu (that still comes from the tick deltas — see
+// COLLECT_PROC_SNAPSHOT) and with thread count and elapsed seconds read
+// straight off this same invocation instead of a separate /proc pass, so
+// they can never land on one side of that race and not the other.
+//
+// cpu/cpuCore start `undefined`, not 0 — this row has not been through a CPU
+// delta yet, and 0 would claim "measured, and idle" when the truth is
+// "not measured". mergeProcRows is what actually assigns a real reading (or
+// leaves it undefined for a process too new to have one).
 function parseNoCpuPsLine(line) {
   var text = String(line || "").trim()
   if (!text) return null
   var parts = text.split(/\s+/)
-  if (parts.length < 8) return null
+  if (parts.length < 10) return null
   return {
     pid: _int(parts[0]),
     ppid: _int(parts[1]),
@@ -559,9 +580,11 @@ function parseNoCpuPsLine(line) {
     stat: parts[4],
     nice: _int(parts[5]),
     rss: _num(parts[6]) * 1024,
-    command: parts.slice(7).join(" "),
-    cpu: 0,
-    cpuCore: 0
+    threads: _int(parts[7]),
+    elapsed: _num(parts[8]),
+    command: parts.slice(9).join(" "),
+    cpu: undefined,
+    cpuCore: undefined
   }
 }
 
@@ -592,9 +615,21 @@ function calcProcCpu(prevTicks, currTicks, dtSeconds, ncpu, clkTck) {
   return out
 }
 
-// Merges computed CPU onto the metadata rows, sorts, and truncates.
-// Rows with no CPU reading yet (first poll, or newly started) sort last rather
-// than being dropped — a process that just appeared is still worth seeing.
+// A pid absent from cpuByPid has not been through a CPU delta yet — most
+// often because it was born since the last poll. Treated as -1 here, one
+// notch below even a genuine, measured 0.0%, so it sorts last rather than
+// competing on equal footing with a process actually confirmed idle.
+function cpuSortValue(r) {
+  return r.cpu === undefined ? -1 : r.cpu
+}
+
+// Merges computed CPU onto the ps-derived rows, sorts, and truncates.
+// Threads and elapsed time are already on each row (parseNoCpuPsLine reads
+// them straight off `ps`); this function no longer touches them. Rows with
+// no CPU reading yet (first poll, or newly started) are left `undefined`
+// rather than forced to 0 and sort last rather than being dropped — a
+// process that just appeared is still worth seeing, and "not yet measured"
+// should not look identical to "confirmed idle" (see cpuSortValue).
 //
 // filterText, when non-empty, matches command, the full command line, and pid
 // (all as case-insensitive substrings) and — this is the point of it —
@@ -603,7 +638,7 @@ function calcProcCpu(prevTicks, currTicks, dtSeconds, ncpu, clkTck) {
 // place, and the process worth searching for is usually the one with nothing
 // to earn it a place in the plain top-N view (a window that stopped
 // responding is idle, not busy).
-function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds, filterText) {
+function mergeProcRows(rows, cpuByPid, sortBy, limit, filterText) {
   var out = []
   for (var i = 0; i < (rows || []).length; i++) {
     var r = rows[i]
@@ -611,15 +646,8 @@ function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds, filte
     // the readings on the rows must survive; only a supplied map overwrites.
     if (cpuByPid) {
       var c = cpuByPid[r.pid]
-      r.cpu = c ? c.cpu : 0
-      r.cpuCore = c ? c.cpuCore : 0
-    }
-    if (meta && meta[r.pid]) {
-      r.threads = meta[r.pid].threads
-      // starttime is measured in clock ticks since boot, so elapsed is
-      // uptime minus that — no dependence on wall-clock or timezone.
-      r.elapsed = uptimeSeconds > 0
-                ? Math.max(0, uptimeSeconds - meta[r.pid].startTicks / 100) : 0
+      r.cpu = c ? c.cpu : undefined
+      r.cpuCore = c ? c.cpuCore : undefined
     }
     out.push(r)
   }
@@ -627,8 +655,8 @@ function mergeProcRows(rows, cpuByPid, sortBy, limit, meta, uptimeSeconds, filte
   // CPU sort leaves the tail as an arbitrary run of idle kernel threads.
   // Breaking ties on memory keeps those rows informative.
   out.sort(sortBy === "mem"
-    ? function(a, b) { return (b.rss - a.rss) || (b.cpu - a.cpu) }
-    : function(a, b) { return (b.cpu - a.cpu) || (b.rss - a.rss) })
+    ? function(a, b) { return (b.rss - a.rss) || (cpuSortValue(b) - cpuSortValue(a)) }
+    : function(a, b) { return (cpuSortValue(b) - cpuSortValue(a)) || (b.rss - a.rss) })
 
   var needle = String(filterText || "").trim().toLowerCase()
   if (needle) {
@@ -1001,6 +1029,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseProcDetailPs: parseProcDetailPs,
     calcProcCpu: calcProcCpu,
     mergeProcRows: mergeProcRows,
+    cpuSortValue: cpuSortValue,
     collectGpuDetail: collectGpuDetail,
     collectProcDetail: collectProcDetail,
     parseGpuDetail: parseGpuDetail,
