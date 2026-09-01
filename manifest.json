@@ -5,9 +5,10 @@
   "version": "2.0.0",
   "author": "jharrison",
   "description": "CPU, memory, GPU, disk, network, process, and temperature monitoring panel",
-  "kinds": ["panel"],
+  "kinds": ["panel", "bar-widget"],
   "entryPoints": {
-    "panel": "Panel.qml"
+    "panel": "Panel.qml",
+    "barWidget": "BarWidget.qml"
   },
   "panel": {
     "displayName": "System Monitor",
@@ -20,6 +21,15 @@
       "processCount": 14,
       "showAllSensors": false,
       "fontScale": 1.25
+    }
+  },
+  "barWidget": {
+    "displayName": "System Monitor",
+    "description": "CPU and memory in the bar, with a quick-reference dropdown",
+    "category": "System",
+    "allowMultiple": false,
+    "defaults": {
+      "pollInterval": 2000
     }
   }
 }

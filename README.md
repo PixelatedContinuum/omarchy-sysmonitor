@@ -1,8 +1,8 @@
 # System Monitor — Omarchy plugin
 
-A native system-monitoring panel for [Omarchy](https://omarchy.org/): CPU, memory, GPU, disk, network and processes in one large floating window, keyboard-driven, in the spirit of btop but drawn by the shell itself.
+A native system-monitoring panel for [Omarchy](https://omarchy.org/): CPU, memory, GPU, disk, network and processes in one large floating window, keyboard-driven, in the spirit of btop but drawn by the shell itself. A bar cell with a quick-reference dropdown sits alongside it for a lighter glance — the full panel stays the deep-dive view.
 
-![kind](https://img.shields.io/badge/kind-panel-blue) ![shell](https://img.shields.io/badge/omarchy-shell-lightgrey)
+![kind](https://img.shields.io/badge/kind-panel-blue) ![kind](https://img.shields.io/badge/kind-bar--widget-blue) ![shell](https://img.shields.io/badge/omarchy-shell-lightgrey)
 
 ## Install
 
@@ -31,6 +31,34 @@ o.window({ tag = "sysmonitor-window" }, { opacity = "1 1" })
 ```
 
 Update with `omarchy plugin update jharrison.sysmonitor`.
+
+## Bar widget
+
+Installing the plugin also registers a `bar-widget` kind — a compact row of icon-prefixed
+readouts (CPU, GPU if a discrete AMD card is detected, memory, CPU temperature, network
+throughput), using the same Nerd Font glyph family Quadrant's own bar cell uses so the two
+read as one visual language rather than two clashing styles. Click it for a condensed
+quick-reference dropdown: the same headline numbers plus disk in a small grid, and the top
+few processes by CPU. It polls independently of the full panel, so it stays current whether
+or not the big window is open.
+
+Not shown anywhere by default; place it in `~/.config/omarchy/shell.json` under `bar.layout`
+(`left`, `center`, or `right`):
+
+```json
+{ "id": "jharrison.sysmonitor" }
+```
+
+If it lands with no visible gap next to whatever's beside it, Omarchy ships a first-party
+`omarchy.spacer` bar-widget for exactly that — drop one into the array with a pixel `size`:
+
+```json
+{ "id": "omarchy.spacer", "size": 24 }
+```
+
+`omarchy-restart-shell` afterwards. The dropdown has an "Open full monitor" link that runs the
+same `omarchy-shell shell toggle jharrison.sysmonitor` command as the keybinding above — a
+second door into the same panel, not a second implementation of it.
 
 ## Uninstall
 
