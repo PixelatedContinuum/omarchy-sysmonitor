@@ -60,6 +60,16 @@ BarWidget {
   implicitWidth: row.implicitWidth
   implicitHeight: row.implicitHeight
 
+  // Bar.qml's own open-panel underline defaults to 55% of "the slot" for
+  // any widget that doesn't say otherwise (checked directly in Bar.qml —
+  // this is exactly the property name it looks for on this item). For a
+  // single-icon widget that reads fine; for a five-segment row it reads as
+  // an underline that mysteriously stops partway through the text. Quadrant
+  // hits the same default and deliberately keeps its own mark short and
+  // centered instead — a valid choice, just not the one asked for here:
+  // this spans the widget's full rendered width.
+  readonly property real openPanelIndicatorWidth: row.implicitWidth
+
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 

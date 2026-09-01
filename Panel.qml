@@ -2143,7 +2143,7 @@ Item {
     id: dr
     property var disk: null
     property int rowIndex: 0
-    implicitHeight: drCol.implicitHeight + Style.space(6)
+    implicitHeight: Math.max(diskRing.height, drCol.implicitHeight) + Style.space(6)
     foreground: root.foreground
     hasCursor: root.cursorActive && root.focusSection === "disk"
                && root.selectedIndex === dr.rowIndex
@@ -2156,12 +2156,23 @@ Item {
       }
     }
 
+    DiskRing {
+      id: diskRing
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(38)
+      height: Style.space(38)
+      percent: dr.disk ? dr.disk.percent : 0
+      warn: dr.disk ? dr.disk.percent >= 90 : false
+    }
+
     Column {
       id: drCol
       anchors.verticalCenter: parent.verticalCenter
-      anchors.left: parent.left
+      anchors.left: diskRing.right
+      anchors.leftMargin: Style.space(10)
       anchors.right: parent.right
-      anchors.leftMargin: Style.space(6)
       anchors.rightMargin: Style.space(6)
       spacing: Style.space(3)
 
@@ -2187,13 +2198,68 @@ Item {
           font.pixelSize: root.fsSmall
         }
       }
+    }
+  }
 
-      MeterBar {
-        width: parent.width
-        value: dr.disk ? dr.disk.percent / 100 : 0
-        warn: dr.disk ? dr.disk.percent >= 90 : false
-        thin: true
+  // Circular disk-usage gauge: a stroked ring rather than disk-lens's
+  // filled pie slice (PieGauge.qml, checked directly) — at this size a ring
+  // reads more clearly as "percentage used" and leaves the center free for
+  // the number itself. Eases toward each new reading via the same
+  // Behavior/NumberAnimation shape MeterBar already uses elsewhere in this
+  // file, rather than a third animation approach.
+  component DiskRing: Item {
+    id: dring
+    property real percent: 0
+    property bool warn: false
+    property real animPercent: percent
+    Behavior on animPercent { NumberAnimation { duration: 450; easing.type: Easing.OutQuad } }
+
+    onAnimPercentChanged: ringCanvas.requestPaint()
+    onWarnChanged: ringCanvas.requestPaint()
+    onWidthChanged: ringCanvas.requestPaint()
+    onHeightChanged: ringCanvas.requestPaint()
+
+    Canvas {
+      id: ringCanvas
+      anchors.fill: parent
+      Component.onCompleted: requestPaint()
+
+      onPaint: {
+        var ctx = getContext("2d")
+        var size = Math.min(width, height)
+        var lineWidth = Math.max(2, size * 0.14)
+        var radius = Math.max(0, size / 2 - lineWidth / 2)
+        var cx = width / 2
+        var cy = height / 2
+        var start = -Math.PI / 2
+        var frac = Math.max(0, Math.min(100, dring.animPercent)) / 100
+
+        ctx.clearRect(0, 0, width, height)
+        ctx.lineCap = "round"
+
+        ctx.beginPath()
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2, false)
+        ctx.lineWidth = lineWidth
+        ctx.strokeStyle = Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+        ctx.stroke()
+
+        if (frac > 0) {
+          ctx.beginPath()
+          ctx.arc(cx, cy, radius, start, start + Math.PI * 2 * frac, false)
+          ctx.lineWidth = lineWidth
+          ctx.strokeStyle = String(dring.warn ? root.urgent : root.accent)
+          ctx.stroke()
+        }
       }
+    }
+
+    Text {
+      anchors.centerIn: parent
+      text: Math.round(dring.animPercent) + "%"
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: root.fsCaption
+      font.bold: true
     }
   }
 
