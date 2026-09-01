@@ -44,8 +44,19 @@ BarWidget {
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color hotColor: bar ? bar.urgent : Color.urgent
 
+  // Symmetric edge margin, not just a gap on whichever side happened to
+  // need one on this machine. WidgetButton (the base every plain first-
+  // party bar widget builds on) reserves 8.5 on each side by default,
+  // which is why two ordinary icons never touch — this widget bypasses
+  // WidgetButton for its multi-segment layout, so without this it would
+  // rely entirely on whatever the *next* plugin over happens to reserve.
+  // A published plugin can't assume what will sit on either side of it,
+  // or which side that even is once someone reorders the bar or moves it
+  // to a vertical edge, so both sides get the same margin unconditionally.
+  readonly property real edgeMargin: Style.spaceReal(8.5)
+
   visible: panelLoader.item !== null
-  implicitWidth: row.implicitWidth
+  implicitWidth: row.implicitWidth + edgeMargin * 2
   implicitHeight: row.implicitHeight
 
   onBarChanged: injectPanel()
@@ -80,6 +91,8 @@ BarWidget {
 
   Row {
     id: row
+    x: root.edgeMargin
+    anchors.verticalCenter: parent.verticalCenter
     spacing: Style.space(18)
 
     Segment { text: root.cpuGlyph + " " + (root.quick ? root.quick.cpuBarText : "…"); hot: root.quick && root.quick.cpuTotalPercent >= 90 }
@@ -91,9 +104,12 @@ BarWidget {
 
   // Sibling of Row, not a child of it — Row forbids anchored children
   // outright ("Row will not function" if one is present), so the click
-  // target has to live at this level, anchored to the row instead.
+  // target has to live at this level. Filling `root` rather than just
+  // `row` means the reserved edge margin is clickable too, not a dead
+  // strip — matching how a normal button's own padding stays part of its
+  // hit target.
   MouseArea {
-    anchors.fill: row
+    anchors.fill: parent
     cursorShape: Qt.PointingHandCursor
     onClicked: root.togglePanel()
   }

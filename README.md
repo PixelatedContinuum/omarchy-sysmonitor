@@ -49,8 +49,11 @@ Not shown anywhere by default; place it in `~/.config/omarchy/shell.json` under 
 { "id": "jharrison.sysmonitor" }
 ```
 
-If it lands with no visible gap next to whatever's beside it, Omarchy ships a first-party
-`omarchy.spacer` bar-widget for exactly that — drop one into the array with a pixel `size`:
+It reserves its own edge margin on both sides — the same convention `WidgetButton` gives
+every ordinary bar widget by default — so it won't crowd whatever ends up next to it, no
+matter which section it's placed in or which side that neighbor is on. If you'd like even
+more breathing room than that as a matter of taste, Omarchy ships a first-party
+`omarchy.spacer` bar-widget — drop one into the array with a pixel `size`:
 
 ```json
 { "id": "omarchy.spacer", "size": 24 }
