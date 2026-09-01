@@ -38,9 +38,9 @@ Installing the plugin also registers a `bar-widget` kind — a compact row of ic
 readouts (CPU, GPU if a discrete AMD card is detected, memory, CPU temperature, network
 throughput), using the same Nerd Font glyph family Quadrant's own bar cell uses so the two
 read as one visual language rather than two clashing styles. Click it for a condensed
-quick-reference dropdown: the same headline numbers plus disk in a small grid, and the top
-few processes by CPU. It polls independently of the full panel, so it stays current whether
-or not the big window is open.
+quick-reference dropdown: the same headline numbers plus disk in an animated grid, and the
+top few processes broken into two sections — by CPU and separately by memory. It polls
+independently of the full panel, so it stays current whether or not the big window is open.
 
 Not shown anywhere by default; place it in `~/.config/omarchy/shell.json` under `bar.layout`
 (`left`, `center`, or `right`):
@@ -82,7 +82,7 @@ clean config.
 | **CPU** | Total plus a per-thread grid, load average, pressure stall (cpu/io/mem), package temperature |
 | **Memory** | RAM, swap, and zram compression ratio |
 | **GPU** | AMD: core and memory-controller utilisation, VRAM, power against cap, sclk/mclk, fan, and all three die temps (edge / junction / mem) |
-| **Disk** | Per-filesystem usage, deduplicated by device, plus NVMe health (temperature, wear, hours, error count) |
+| **Disk** | Per-filesystem usage as an animated ring gauge with the percentage in its center, deduplicated by device, plus NVMe health (temperature, wear, hours, error count) |
 | **Network** | Interface throughput and per-process traffic via bandwhich |
 | **Processes** | CPU, threads, runtime, memory; search by name or pid; click for executable path, working directory and full ancestry; terminate, force-kill, renice, or open in `lsof` |
 
