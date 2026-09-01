@@ -2161,8 +2161,10 @@ Item {
       anchors.left: parent.left
       anchors.leftMargin: Style.space(6)
       anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(38)
-      height: Style.space(38)
+      // Bigger ring, same font.pixelSize on the center text — the point is
+      // more room between the number and the stroke, not larger numbers.
+      width: Style.space(52)
+      height: Style.space(52)
       percent: dr.disk ? dr.disk.percent : 0
       warn: dr.disk ? dr.disk.percent >= 90 : false
     }
