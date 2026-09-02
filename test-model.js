@@ -646,7 +646,7 @@ check("parseThemePalette ignores non-colour values rather than guessing at them"
 check("parseThemePalette returns an empty object for empty, null and garbage input",
       Object.keys(M.parseThemePalette("")).length === 0
       && Object.keys(M.parseThemePalette(null)).length === 0
-      && Object.keys(M.parseThemePalette("  nonsense")).length === 0)
+      && Object.keys(M.parseThemePalette("  nonsense")).length === 0)
 var paletteRaw = sh(M.COLLECT_THEME_PALETTE) || ""
 if (!paletteRaw.trim()) skipped("live theme palette", "no colors.toml for the active theme")
 else {
