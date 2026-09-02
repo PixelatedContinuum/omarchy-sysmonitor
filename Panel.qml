@@ -1138,48 +1138,17 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(16)
             anchors.rightMargin: Style.space(16)
-            implicitHeight: Math.max(titleBlock.implicitHeight, summaryRow.implicitHeight)
+            implicitHeight: Math.max(titleText.implicitHeight, summaryRow.implicitHeight)
 
-            // The machine's identity sits with the panel's name rather than
-            // buried in the CPU and GPU sections. Those two model lines used
-            // to live inside their own sections, which put the two halves of
-            // "what machine is this" a full column apart and spent a line of
-            // each section on something that never changes.
-            Column {
-              id: titleBlock
+            Text {
+              id: titleText
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-
-              Text {
-                id: titleText
-                text: "System Monitor"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.fsHeading
-                font.bold: true
-              }
-
-              Text {
-                id: hardwareLine
-                // Hidden rather than elided once the window narrows: this is
-                // identity, not a live reading, so it is the first thing that
-                // should give up its space to the figures beside it.
-                visible: root.contentWidth >= 760 && text !== ""
-                textFormat: Text.PlainText
-                text: {
-                  var bits = []
-                  if (root.cpuModelShort !== "")
-                    bits.push(Model.truncateDisplay(root.cpuModelShort, 60))
-                  if (root.gpuModel !== "")
-                    bits.push(Model.truncateDisplay(root.gpuModel, 60))
-                  return bits.join("   ·   ")
-                }
-                color: root.dimmer
-                elide: Text.ElideRight
-                font.family: root.fontFamily
-                font.pixelSize: root.fsCaption
-              }
+              text: "System Monitor"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: root.fsHeading
+              font.bold: true
             }
 
             Row {
@@ -1570,6 +1539,7 @@ Item {
               SectionHeader {
                 width: parent.width
                 title: "CPU"
+                subtitle: root.cpuModelShort
                 titleColor: root.secCpu
                 Component.onCompleted: root.registerAnchor("cpu", this)
                 value: (root.cpuTemp > 0 ? Model.formatTemp(root.cpuTemp) + "     " : "")
@@ -1616,10 +1586,10 @@ Item {
                 }
               }
 
-              // The CPU model moved up beside the panel title, with the GPU's.
-              // The thread count went with it only in spirit: it is already
-              // implied by the core grid directly above, which draws one block
-              // per thread.
+              // The CPU model moved up into this section's own heading, where
+              // it names the device the heading is about. The thread count
+              // stayed here, next to the core grid it describes, which draws
+              // one block per thread.
               Text {
                 width: parent.width
                 visible: root.cpuCorePercents.length > 0
@@ -1732,6 +1702,7 @@ Item {
                     width: parent.width
                     visible: root.gpuPath !== ""
                     title: "GPU"
+                    subtitle: root.gpuModel
                     titleColor: root.secGpu
                     Component.onCompleted: root.registerAnchor("gpu", this)
                     value: root.gpuInfo
@@ -1792,11 +1763,11 @@ Item {
                     fill: root.secGpu
                   }
 
-                  // The GPU model moved up beside the panel title, with the
-                  // CPU's. Total VRAM stayed behind rather than following it:
-                  // the vram meter two rows above already states it, so
-                  // carrying it into the header would have duplicated a
-                  // figure rather than relocating one.
+                  // The GPU model moved up into this section's own heading,
+                  // where it names the device the heading is about. Total
+                  // VRAM did not go with it: the vram meter above already
+                  // states it, so carrying it up would have duplicated a
+                  // figure rather than relocated one.
 
                   Text {
                     width: parent.width
@@ -2750,6 +2721,10 @@ Item {
   component SectionHeader: Item {
     id: sh
     property string title: ""
+    // The device the section is about, e.g. the CPU or GPU model, shown just
+    // after the heading. Optional: sections describing no single device
+    // (MEMORY, DISK, NETWORK) leave it empty and render exactly as before.
+    property string subtitle: ""
     property string value: ""
     // Defaults to the accent so a heading that forgets to name a colour still
     // renders as it always did, rather than as an invalid colour.
@@ -2770,12 +2745,37 @@ Item {
       fontFamily: root.fontFamily
       fontSize: root.fsBody
     }
+    // The device name, muted and at caption size so the coloured heading
+    // still leads and this reads as an annotation on it rather than as a
+    // second heading.
+    //
+    // Empty text rather than visible:false when it should not show, because
+    // shVal anchors to this item's right edge: an invisible item keeps its
+    // width and would leave a gap, while an empty one collapses to nothing
+    // and the value closes up as if this were not here at all. The width cap
+    // stops a long model name from squeezing the live figures on its right,
+    // which matter more than the name does.
+    Text {
+      id: shSub
+      anchors.left: shHdr.right
+      anchors.leftMargin: text !== "" ? Style.space(8) : 0
+      anchors.verticalCenter: parent.verticalCenter
+      width: Math.min(implicitWidth, sh.width * 0.4)
+      textFormat: Text.PlainText
+      text: (sh.subtitle !== "" && root.contentWidth >= 620)
+            ? "- " + Model.truncateDisplay(sh.subtitle, 60) : ""
+      color: root.dimmer
+      elide: Text.ElideRight
+      font.family: root.fontFamily
+      font.pixelSize: root.fsCaption
+    }
+
     // Bounded by the title rather than free-floating: at minimum width the
     // value ("13%   load 2.91 2.48 1.85") would otherwise run left underneath
     // the heading instead of eliding.
     Text {
       id: shVal
-      anchors.left: shHdr.right
+      anchors.left: shSub.right
       anchors.leftMargin: Style.space(12)
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
