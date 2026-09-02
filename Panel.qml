@@ -115,6 +115,10 @@ Item {
   readonly property color secDisk: themeColor("cyan", accent)
   readonly property color secNet: themeColor("orange", accent)
   readonly property color secProc: themeColor("yellow", accent)
+  // Gold, matching the site's own accent-gold, rather than a seventh hue from
+  // the rotation: red would be the obvious colour for heat and is reserved
+  // here for the alert state this section's own values use.
+  readonly property color secThermal: themeColor("brown", accent)
 
   // Monospace throughout: this is a wall of numbers, and proportional digits
   // make the columns jitter as values change.
@@ -154,6 +158,46 @@ Item {
 
   property string gpuPath: ""
   property string gpuModel: ""          // marketing name, the GPU's counterpart to cpuModel
+
+  // Rolling sample history behind the sparklines. Every figure on this panel
+  // used to be instantaneous, which answers "what is it now" but never "is it
+  // climbing", and the latter is usually the question worth asking. These are
+  // the same samples the collectors already produce, kept rather than
+  // discarded, so nothing new is read to draw them.
+  //
+  // 60 entries at the default 2s poll is about two minutes of history. The
+  // buffers are trimmed on push rather than allowed to grow, since the panel
+  // can stay open for days.
+  readonly property int historyLength: 45
+  property var cpuHistory: []
+  property var memHistory: []
+  property var gpuHistory: []
+  property var netRxHistory: []
+  property var netTxHistory: []
+
+  // Returns a NEW array rather than mutating in place: QML only re-evaluates
+  // bindings on a var property when the property itself is reassigned, so a
+  // push onto the existing array would update the data without ever
+  // repainting anything that reads it.
+  function pushHistory(buf, value) {
+    var out = buf.slice(Math.max(0, buf.length - historyLength + 1))
+    out.push(value)
+    return out
+  }
+
+  // One scale across both network graphs, taken from the busier direction, so
+  // down and up stay visually comparable. Autoscaling each on its own would
+  // draw a 2 KB/s trickle and a 90 MB/s transfer as identically full graphs.
+  readonly property real netScale: {
+    var m = 0
+    for (var i = 0; i < netRxHistory.length; i++)
+      if (netRxHistory[i] > m) m = netRxHistory[i]
+    for (var j = 0; j < netTxHistory.length; j++)
+      if (netTxHistory[j] > m) m = netTxHistory[j]
+    // A floor keeps an idle link from magnifying its own noise into a full
+    // graph: below 64 KB/s the graphs read as near-empty, which is honest.
+    return Math.max(m, 65536)
+  }
   property int gpuUtil: 0
   property real gpuTemp: 0
   property var gpuInfo: null           // full readout — VRAM, power, clocks, temps
@@ -211,8 +255,11 @@ Item {
   // against the monospace column widths below — not round numbers.
   readonly property real contentWidth: scrollArea.availableWidth
 
-  readonly property int coreColumns: contentWidth >= 960 ? 4
-                                   : contentWidth >= 620 ? 2 : 1
+  // Heatmap blocks are square-ish and much narrower than the labelled rows
+  // they replaced, so the grid runs many more across: eight at full width
+  // puts a 16-thread machine on two tidy rows.
+  readonly property int coreColumns: contentWidth >= 960 ? 8
+                                   : contentWidth >= 620 ? 4 : 2
   readonly property bool twoColumnDash: contentWidth >= 700
   readonly property int detailColumns: contentWidth >= 640 ? 4 : 2
 
@@ -260,6 +307,31 @@ Item {
     return out
   }
 
+  // Everything the THERMAL section shows, assembled in one place so the
+  // section itself stays a plain repeater over a list.
+  //
+  // Each entry carries its own "hot" threshold, because the number that means
+  // trouble is different per part: a CPU package at 70C is unremarkable and a
+  // drive at 70C is at the top of its rated range. A single shared threshold
+  // would necessarily be wrong for one of them.
+  readonly property var thermalReadings: {
+    var out = []
+    if (cpuTemp > 0) out.push({ label: "CPU package", tempC: cpuTemp, hot: 85 })
+    if (gpuInfo && gpuInfo.temps) {
+      var n = Math.min(gpuInfo.temps.length, 12)
+      for (var i = 0; i < n; i++)
+        out.push({ label: "GPU " + gpuInfo.temps[i].label,
+                   tempC: gpuInfo.temps[i].tempC,
+                   // Junction is the reading that actually throttles the card
+                   // and runs hotter than the others by design, so it gets a
+                   // higher bar before it counts as hot.
+                   hot: gpuInfo.temps[i].label === "junction" ? 100 : 90 })
+    }
+    for (var d = 0; d < driveTemps.length; d++)
+      out.push({ label: driveTemps[d].display, tempC: driveTemps[d].tempC, hot: 70 })
+    return out
+  }
+
   // The single most useful temperature to surface at a glance: whatever is
   // currently hottest, named. Which component that is changes with load, so
   // pinning it to the CPU would hide a GPU or drive running away.
@@ -274,6 +346,10 @@ Item {
   readonly property var visibleSections: {
     var s = ["cpu", "memory"]
     if (gpuPath !== "") s.push("gpu")
+    // Only navigable when it has something in it: a machine exposing no
+    // temperature at all would otherwise get a jump target to an empty
+    // heading.
+    if (thermalReadings.length > 0) s.push("thermal")
     s.push("disk", "network", "processes")
     return s
   }
@@ -732,6 +808,10 @@ Item {
           root.cpuTotalPercent = p.total
           root.cpuCorePercents = p.cores
           root.cpuPrimed = true
+          // Only recorded once primed: the first poll has no previous sample
+          // to delta against, and charting its placeholder 0 would put a
+          // false trough at the start of every graph.
+          root.cpuHistory = root.pushHistory(root.cpuHistory, p.total)
         }
         root.cpuStatPrev = curr
       }
@@ -757,6 +837,9 @@ Item {
         var parts = String(text || "").split("---")
         root.memInfo = Model.parseFree(parts[0])
         root.zramInfo = parts.length > 1 ? Model.parseZram(parts[1]) : null
+        if (root.memInfo && root.memInfo.memTotal > 0)
+          root.memHistory = root.pushHistory(root.memHistory,
+            100 * root.memInfo.memUsed / root.memInfo.memTotal)
       }
     }
   }
@@ -780,7 +863,17 @@ Item {
         var now = Date.now()
         if (root.netPrev && root.netPrevAt > 0) {
           var dt = (now - root.netPrevAt) / 1000
-          if (dt > 0) root.netRates = Model.calcNetRate(root.netPrev, curr, dt)
+          if (dt > 0) {
+            root.netRates = Model.calcNetRate(root.netPrev, curr, dt)
+            var pr = root.netRates[root.primaryIface]
+            // Both directions share one autoscaled graph, so they are
+            // recorded together or not at all; charting one against a stale
+            // partner would misstate the balance between them.
+            if (pr) {
+              root.netRxHistory = root.pushHistory(root.netRxHistory, pr.rxRate)
+              root.netTxHistory = root.pushHistory(root.netTxHistory, pr.txRate)
+            }
+          }
         }
         root.netPrev = curr
         root.netPrevAt = now
@@ -797,6 +890,7 @@ Item {
         var g = Model.parseGpuDetail(text)
         root.gpuInfo = g
         root.gpuUtil = g.busy
+        root.gpuHistory = root.pushHistory(root.gpuHistory, g.busy)
         // "edge" is the die-surface reading and the closest analogue to a
         // single CPU package temperature; junction runs hotter by design.
         for (var i = 0; i < g.temps.length; i++)
@@ -1070,25 +1164,28 @@ Item {
                      : root.contentWidth >= 900 ? Style.space(36)
                      : Style.space(24)
 
-              Stat {
+              RingStat {
                 label: "CPU"
-                value: root.cpuPrimed ? root.cpuTotalPercent + "%" : "--"
+                percent: root.cpuPrimed ? root.cpuTotalPercent : 0
                 warn: root.cpuTotalPercent >= 85
+                ringColor: root.secCpu
               }
-              Stat {
+              RingStat {
                 label: "MEM"
-                value: root.memInfo && root.memInfo.memTotal > 0
-                       ? Math.round((root.memInfo.memTotal - root.memInfo.memAvail)
-                                    / root.memInfo.memTotal * 100) + "%" : "--"
+                percent: root.memInfo && root.memInfo.memTotal > 0
+                         ? 100 * (root.memInfo.memTotal - root.memInfo.memAvail)
+                           / root.memInfo.memTotal : 0
                 warn: root.memInfo && root.memInfo.memTotal > 0
                       && (root.memInfo.memTotal - root.memInfo.memAvail)
                          / root.memInfo.memTotal > 0.9
+                ringColor: root.secMem
               }
-              Stat {
+              RingStat {
                 visible: root.gpuPath !== ""
                 label: "GPU"
-                value: root.gpuUtil + "%"
+                percent: root.gpuUtil
                 warn: root.gpuUtil >= 90
+                ringColor: root.secGpu
               }
               // Labelled TEMP rather than by device: with the device name as
               // the label it renders a second "CPU" beside the usage stat and
@@ -1453,6 +1550,13 @@ Item {
                 warn: root.cpuTotalPercent >= 85
               }
 
+              Sparkline {
+                width: parent.width
+                height: Style.space(22)
+                values: root.cpuHistory
+                fill: root.secCpu
+              }
+
               // Core columns reflow with width: four across at full size, two
               // when tiled to half a screen, one when narrower. A fixed four
               // would squeeze each cell's bar to nothing.
@@ -1461,15 +1565,15 @@ Item {
                 width: parent.width
                 visible: root.showCpuPerCore && root.cpuCorePercents.length > 0
                 columns: root.coreColumns
-                columnSpacing: Style.space(18)
-                rowSpacing: Style.space(3)
+                columnSpacing: Style.space(4)
+                rowSpacing: Style.space(4)
 
                 Repeater {
                   model: root.cpuCorePercents.length
                   delegate: CoreCell {
                     required property int index
                     coreIndex: index
-                    width: (coreGrid.width - Style.space(18) * (root.coreColumns - 1))
+                    width: (coreGrid.width - Style.space(4) * (root.coreColumns - 1))
                            / root.coreColumns
                   }
                 }
@@ -1546,6 +1650,13 @@ Item {
                            ? (root.memInfo.memTotal - root.memInfo.memAvail) / root.memInfo.memTotal : 0
                     warn: root.memInfo && root.memInfo.memTotal > 0
                           && (root.memInfo.memTotal - root.memInfo.memAvail) / root.memInfo.memTotal > 0.9
+                  }
+
+                  Sparkline {
+                    width: parent.width
+                    height: Style.space(20)
+                    values: root.memHistory
+                    fill: root.secMem
                   }
 
                   LabelledMeter {
@@ -1635,6 +1746,13 @@ Item {
                     detail: root.gpuInfo ? Model.formatWatts(root.gpuInfo.watts) : ""
                   }
 
+                  Sparkline {
+                    width: parent.width
+                    height: Style.space(20)
+                    values: root.gpuHistory
+                    fill: root.secGpu
+                  }
+
                   // The GPU's identity line, in the same position and the same
                   // muted weight the CPU model takes under its core grid, and
                   // paired with total VRAM the way the CPU model is paired
@@ -1678,34 +1796,72 @@ Item {
                     font.pixelSize: root.fsCaption
                   }
 
-                  // edge / junction / mem are genuinely different sensors, and
-                  // junction is the one that throttles the card.
-                  Text {
+                  // GPU temperatures moved to the THERMAL section below. They
+                  // are three of the readings it gathers, and splitting the
+                  // machine's temperatures across three sections meant
+                  // answering "what is running hot" required looking in three
+                  // places.
+
+                  PanelSeparator { width: parent.width; foreground: root.foreground }
+
+                  // Every temperature the panel can read, in one place. These
+                  // were spread across three sections (CPU package in the CPU
+                  // header, the card's three sensors under GPU, drive
+                  // temperatures under DISK), which is fine for reading one of
+                  // them and poor for the question people actually ask of a
+                  // temperature display, which is whether anything is hot.
+                  //
+                  // All of it comes from hwmon, the same world-readable
+                  // interface behind every other sensor here, so this section
+                  // needs nothing the rest of the panel did not already have.
+                  SectionHeader {
                     width: parent.width
-                    visible: root.gpuInfo !== null && root.gpuInfo.temps.length > 0
-                    textFormat: Text.PlainText
-                    text: {
-                      if (!root.gpuInfo) return ""
-                      var bits = []
-                      var n = Math.min(root.gpuInfo.temps.length, 12)
-                      for (var i = 0; i < n; i++)
-                        bits.push(Model.truncateDisplay(root.gpuInfo.temps[i].label, 40) + " "
-                                  + Model.formatTemp(root.gpuInfo.temps[i].tempC))
-                      return bits.join("     ")
-                    }
-                    color: root.gpuInfo && root.gpuInfo.temps.some(function(t) {
-                             return t.tempC >= 90 }) ? root.urgent : root.foreground
-                    elide: Text.ElideRight
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fsCaption
+                    title: "THERMAL"
+                    titleColor: root.secThermal
+                    Component.onCompleted: root.registerAnchor("thermal", this)
+                    value: root.hottest
+                           ? "hottest " + Model.formatTemp(root.hottest.tempC) : ""
                   }
 
-                  // The SENSORS list was removed: GPU temperatures already sit
-                  // in the GPU section, drive temperatures under DISK, and the
-                  // CPU package temperature on the CPU header, so the section
-                  // had become a second copy of all three. Sensors are still
-                  // collected, and are now the only source for all three of
-                  // those readings.
+                  Grid {
+                    width: parent.width
+                    columns: root.contentWidth >= 700 ? 3 : 2
+                    columnSpacing: Style.space(14)
+                    rowSpacing: Style.space(4)
+
+                    Repeater {
+                      model: root.thermalReadings
+                      delegate: Item {
+                        required property var modelData
+                        width: (parent.width - Style.space(14) * (parent.columns - 1))
+                               / parent.columns
+                        height: Style.space(18)
+
+                        Text {
+                          anchors.left: parent.left
+                          anchors.verticalCenter: parent.verticalCenter
+                          textFormat: Text.PlainText
+                          text: Model.truncateDisplay(modelData.label, 24)
+                          color: root.dimmer
+                          elide: Text.ElideRight
+                          font.family: root.fontFamily
+                          font.pixelSize: root.fsCaption
+                        }
+                        Text {
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: Model.formatTemp(modelData.tempC)
+                          // Thresholds differ by part: a drive at 70 is hot, a
+                          // CPU package at 70 is ordinary, so each reading
+                          // carries its own rather than sharing one number that
+                          // would be wrong for something.
+                          color: modelData.tempC >= modelData.hot ? root.urgent : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: root.fsCaption
+                        }
+                      }
+                    }
+                  }
                 }
 
                 Column {
@@ -1736,26 +1892,9 @@ Item {
                     }
                   }
 
-                  // One row per NVMe controller. Bounded by the hardware
-                  // itself rather than by a limit here: hwmon publishes one
-                  // node per controller present.
-                  Repeater {
-                    model: root.driveTemps
-                    delegate: Text {
-                      required property var modelData
-                      width: rightCol.width
-                      textFormat: Text.PlainText
-                      text: Model.truncateDisplay(modelData.display, 40)
-                            + "   " + Model.formatTemp(modelData.tempC)
-                      // NVMe controllers throttle in the high seventies, so
-                      // 70 is the point where the number is worth noticing
-                      // rather than an alarm in itself.
-                      color: modelData.tempC >= 70 ? root.urgent : root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fsCaption
-                      elide: Text.ElideRight
-                    }
-                  }
+                  // Drive temperatures moved to the THERMAL section, with the
+                  // machine's other temperatures. They are still read the
+                  // same way, from hwmon, and driveTemps still feeds them.
 
                   PanelSeparator { width: parent.width; foreground: root.foreground }
 
@@ -1781,6 +1920,28 @@ Item {
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: root.fsBody
+                  }
+
+                  // Down and up share one autoscaled scale so their relative
+                  // size stays honest: drawn separately they would each fill
+                  // their own graph and a trickle would look like a flood.
+                  // maxValue 0 autoscales, since a link rate has no ceiling
+                  // to measure against the way a percentage does.
+                  Sparkline {
+                    id: netRxSpark
+                    width: parent.width
+                    height: Style.space(18)
+                    values: root.netRxHistory
+                    maxValue: root.netScale
+                    fill: root.secNet
+                  }
+
+                  Sparkline {
+                    width: parent.width
+                    height: Style.space(18)
+                    values: root.netTxHistory
+                    maxValue: root.netScale
+                    fill: Qt.darker(root.secNet, 1.35)
                   }
 
                 }
@@ -2336,6 +2497,150 @@ Item {
     }
   }
 
+  // A rolling history graph. Bars rather than a filled Canvas path: this is
+  // already a panel of bars and rings, a Repeater of Rectangles needs no
+  // repaint plumbing, and 60 of them redrawn on a 2s poll costs nothing next
+  // to the Canvas rings that are already here.
+  //
+  // Bars are positioned from the RIGHT, so the newest sample is always
+  // pinned to the right edge and a partially-filled buffer grows leftward
+  // into empty space rather than stretching to fill the width and rescaling
+  // itself every poll for the first two minutes.
+  //
+  // maxValue: 0 means autoscale to the tallest sample present, which is what
+  // network throughput needs (a rate has no ceiling to scale against, and a
+  // fixed one would flatten every graph that is not a saturated link).
+  // Anything measured in percent passes 100 and gets a stable scale.
+  component Sparkline: Item {
+    id: spark
+    property var values: []
+    property real maxValue: 100
+    property color fill: root.accent
+    readonly property int slots: root.historyLength
+    readonly property real slotWidth: width / Math.max(1, slots)
+    readonly property real scale: {
+      if (spark.maxValue > 0) return spark.maxValue
+      var m = 0
+      for (var i = 0; i < spark.values.length; i++)
+        if (spark.values[i] > m) m = spark.values[i]
+      return m > 0 ? m : 1
+    }
+
+    // A faint bed and baseline, so an idle graph reads as an empty chart
+    // rather than as a gap in the layout. Without them a machine sitting at
+    // 2% draws sub-pixel bars into blank space, which looks like a rendering
+    // fault rather than like "nothing is happening".
+    Rectangle {
+      anchors.fill: parent
+      radius: 2
+      color: Qt.rgba(spark.fill.r, spark.fill.g, spark.fill.b, 0.05)
+    }
+    Rectangle {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      height: 1
+      color: Qt.rgba(spark.fill.r, spark.fill.g, spark.fill.b, 0.22)
+    }
+
+    Repeater {
+      model: spark.values.length
+      delegate: Rectangle {
+        required property int index
+        // Index counted back from the newest, so bar 0 sits at the right.
+        readonly property int fromEnd: spark.values.length - 1 - index
+        readonly property real frac:
+          Math.max(0, Math.min(1, spark.values[index] / spark.scale))
+        width: Math.max(1, spark.slotWidth - 1)
+        // Any non-zero sample gets at least 2px, so a low but real value is
+        // still visible instead of rounding away to the baseline.
+        height: frac > 0 ? Math.max(2, spark.height * frac) : 1
+        x: spark.width - (fromEnd + 1) * spark.slotWidth
+        y: spark.height - height
+        radius: width > 2 ? 1 : 0
+        color: spark.fill
+        // Older samples fade, which reads as direction of time without
+        // needing an axis or a label to say so.
+        opacity: 0.30 + 0.70 * (1 - fromEnd / Math.max(1, spark.slots - 1))
+      }
+    }
+  }
+
+  // The percentage figures in the top strip, as small rings rather than as
+  // text. The disk section already reads its four figures as rings, so three
+  // more here means the panel has one gauge language for "fraction of a
+  // whole" instead of rings in one place and bare numbers in another; a ring
+  // also carries its value pre-attentively, which a number cannot.
+  //
+  // Only the three genuine percentages become rings. Temperature, throughput
+  // and uptime stay as text Stats, because none of them is a fraction of a
+  // known maximum and a ring would have to invent one to draw itself.
+  component RingStat: Column {
+    id: rstat
+    property string label: ""
+    property real percent: 0
+    property bool warn: false
+    property color ringColor: root.accent
+    spacing: Style.space(3)
+
+    Item {
+      width: Style.space(34)
+      height: Style.space(34)
+      anchors.horizontalCenter: parent.horizontalCenter
+
+      Canvas {
+        id: statCanvas
+        anchors.fill: parent
+        Component.onCompleted: requestPaint()
+        onPaint: {
+          var ctx = getContext("2d")
+          var size = Math.min(width, height)
+          var lw = Math.max(2, size * 0.13)
+          var radius = Math.max(0, size / 2 - lw / 2)
+          var frac = Math.max(0, Math.min(100, rstat.percent)) / 100
+          ctx.clearRect(0, 0, width, height)
+          ctx.lineCap = "round"
+          ctx.beginPath()
+          ctx.arc(width / 2, height / 2, radius, 0, Math.PI * 2, false)
+          ctx.lineWidth = lw
+          ctx.strokeStyle = Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+          ctx.stroke()
+          if (frac > 0) {
+            ctx.beginPath()
+            ctx.arc(width / 2, height / 2, radius, -Math.PI / 2,
+                    -Math.PI / 2 + Math.PI * 2 * frac, false)
+            ctx.lineWidth = lw
+            ctx.strokeStyle = String(rstat.warn ? root.urgent : rstat.ringColor)
+            ctx.stroke()
+          }
+        }
+      }
+
+      Text {
+        anchors.centerIn: parent
+        text: Math.round(rstat.percent) + "%"
+        color: rstat.warn ? root.urgent : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: root.fsCaption
+        font.bold: true
+      }
+    }
+
+    Text {
+      anchors.horizontalCenter: parent.horizontalCenter
+      text: rstat.label
+      color: root.dimmer
+      font.family: root.fontFamily
+      font.pixelSize: root.fsCaption
+    }
+
+    // Canvas does not track the properties its paint handler reads, so every
+    // input that changes the drawing has to ask for a repaint by hand.
+    onPercentChanged: statCanvas.requestPaint()
+    onWarnChanged: statCanvas.requestPaint()
+    onRingColorChanged: statCanvas.requestPaint()
+  }
+
   // One figure in the top summary strip: small dim label over a large value.
   component Stat: Column {
     property string label: ""
@@ -2365,43 +2670,47 @@ Item {
     }
   }
 
+  // One core as a filled block whose intensity is its load, rather than as a
+  // labelled row with its own bar and number. Sixteen labelled rows answered
+  // "what is core 9 doing" precisely and "is anything pegged" slowly, which
+  // is the wrong way round for a glance: the block grid answers the second
+  // question immediately from colour alone, and still carries the number for
+  // the first whenever the cell is wide enough to hold it legibly.
+  //
+  // The core's own index is dropped: position gives it, reading left to
+  // right, and sixteen "cN" labels were a third of the grid's ink spent on
+  // something the layout already says.
   component CoreCell: Item {
     id: cell
     property int coreIndex: 0
     readonly property bool present: coreIndex < root.cpuCorePercents.length
     readonly property int pct: present ? root.cpuCorePercents[coreIndex] : 0
-    height: Style.space(14)
+    // Saturation rides the load, floored so an idle core is still a visible
+    // cell rather than a hole in the grid, and crosses to the alert colour at
+    // the same 85% the bars use.
+    readonly property color cellColor: pct >= 85 ? root.urgent : root.secCpu
+    height: Style.space(20)
 
-    Text {
-      id: coreLabel
-      anchors.left: parent.left
-      anchors.verticalCenter: parent.verticalCenter
+    Rectangle {
+      anchors.fill: parent
       visible: cell.present
-      text: "c" + cell.coreIndex
-      color: root.dimmer
-      font.family: root.fontFamily
-      font.pixelSize: root.fsSmall
-    }
-    MeterBar {
-      anchors.left: coreLabel.right
-      anchors.leftMargin: Style.space(6)
-      anchors.right: corePct.left
-      anchors.rightMargin: Style.space(6)
-      anchors.verticalCenter: parent.verticalCenter
-      visible: cell.present
-      value: cell.pct / 100
-      warn: cell.pct >= 85
-      thin: true
-    }
-    Text {
-      id: corePct
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      visible: cell.present
-      text: cell.pct + "%"
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: root.fsSmall
+      radius: 2
+      color: Qt.rgba(cell.cellColor.r, cell.cellColor.g, cell.cellColor.b,
+                     0.10 + 0.75 * Math.min(1, cell.pct / 100))
+      border.width: 1
+      border.color: Qt.rgba(cell.cellColor.r, cell.cellColor.g, cell.cellColor.b, 0.30)
+
+      Text {
+        anchors.centerIn: parent
+        // Below roughly this width the number stops fitting inside the cell
+        // and would clip rather than elide, so the block carries its load by
+        // colour alone at narrow widths.
+        visible: cell.width >= Style.space(34)
+        text: cell.pct + "%"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: root.fsCaption
+      }
     }
   }
 
