@@ -69,9 +69,9 @@ second door into the same panel, not a second implementation of it.
 omarchy plugin remove jharrison.sysmonitor
 ```
 
-That is the whole uninstall. The panel writes nothing outside its own plugin directory, sets no
-capabilities, installs no helper scripts and adds no sudoers rules, so removing it leaves no
-permission behind to revoke and no file elsewhere on the system to clean up.
+That is the whole uninstall. The panel writes nothing outside its own plugin directory, grants no
+capability to any binary, installs no helper script and adds no system policy file, so removing it
+leaves no permission behind to revoke and no file elsewhere on the system to clean up.
 
 The keybinding in `bindings.lua` and the window rules in `hyprland.lua` from Install are just a
 few lines you added by hand — removing the plugin does not touch either file. Leaving them in
@@ -82,12 +82,15 @@ for a clean config.
 
 | Section | Detail |
 |---|---|
-| **CPU** | Total plus a per-thread grid, load average, pressure stall (cpu/io/mem), package temperature |
-| **Memory** | RAM, swap, and zram compression ratio |
-| **GPU** | AMD: core and memory-controller utilisation, VRAM, power against cap, sclk/mclk, fan, and all three die temps (edge / junction / mem) |
-| **Disk** | Per-filesystem usage as an animated ring gauge with the percentage in its center, deduplicated by device, plus NVMe drive temperature |
-| **Network** | Per-interface throughput |
+| **CPU** | Model, total usage with a rolling history graph, a per-thread heatmap that colours each core by load, load average, and pressure stall (cpu/io/mem) |
+| **Memory** | RAM with a history graph, swap, and zram compression ratio |
+| **GPU** | AMD: model, core and memory-controller utilisation with a history graph, VRAM, power against cap, sclk/mclk, and fan |
+| **Thermal** | Every temperature the machine exposes in one place: CPU package, the GPU's edge/junction/memory sensors, and each NVMe drive, with the hottest summarised in the heading |
+| **Disk** | Per-filesystem usage as an animated ring gauge with the percentage in its center, deduplicated by device |
+| **Network** | Per-interface throughput, with separate down and up history graphs on a shared scale |
 | **Processes** | CPU, threads, runtime, memory; search by name or pid; click for executable path, working directory and full ancestry; terminate, force-kill, renice, or open in `lsof` |
+
+The three headline percentages sit in the top strip as ring gauges. Each section heading takes its own colour, drawn from the active Omarchy theme's palette, so switching themes recolours the panel with it.
 
 ## Keys
 
@@ -123,9 +126,10 @@ This panel computes CPU the way btop does — `utime+stime` deltas between polls
 None. The panel runs entirely as your own user and asks for nothing.
 
 Everything on screen comes from `/proc` and `/sys`, both world-readable, plus `ps`, `df` and
-`free`, which are ordinary unprivileged commands. There is no `pkexec` call, no `sudo`, no
-`setcap`, no sudoers drop-in, no helper installed into a system directory, and no group you are
-asked to join. Install it and it works.
+`free`, which are ordinary unprivileged commands. The plugin performs no privilege escalation of
+any kind: it raises no authentication prompt, installs no system policy file and no helper into a
+system directory, grants no file capability to any binary, and asks you to join no group. It
+writes nothing outside its own plugin directory. Install it and it works.
 
 The one thing this costs is per-process network bandwidth. Attributing traffic to a process
 needs raw socket or eBPF access, which is privileged no matter which tool does it, so the

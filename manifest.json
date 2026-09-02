@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jharrison.sysmonitor",
   "name": "System Monitor",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "author": "jharrison",
   "description": "CPU, memory, GPU, disk, network, process, and temperature monitoring panel",
   "kinds": ["panel", "bar-widget"],

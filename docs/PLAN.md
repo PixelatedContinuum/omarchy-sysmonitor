@@ -12,7 +12,7 @@ A comprehensive system monitoring panel for Omarchy that aggregates CPU, memory,
 > **Superseded in part, 2026-09-02.** Everything below describing privileged features is now
 > history, not current behaviour. The plugin no longer asks for any privilege at all: the
 > bandwhich per-process network rows, the `smartctl` drive-health rows, and the whole
-> `pkexec`/`setcap`/sudoers grant-and-revoke subsystem built around them were removed. Drive
+> privilege grant-and-revoke subsystem built around them were removed. Drive
 > temperature survives, read unprivileged from `hwmon` and shown under DISK; per-process network
 > bandwidth is gone, having no unprivileged equivalent on Linux. This document is kept as the
 > design record, including the five rounds of adversarial review that subsystem went through and
@@ -89,7 +89,7 @@ Confirmed by resizing the live window and screenshotting each width. Three real 
 | GPU metric with CPU-like depth | `core` / `mem` / `vram` / `power` bars, plus sclk+mclk clocks, fan RPM, and all three die temps (edge / junction / mem). AMD exposes far more than `gpu_busy_percent`. |
 | Sensors named for what they measure | `friendlySensorName()` maps driver names to sensors: coretemp→CPU, amdgpu→GPU, acpitz→Motherboard, iwlwifi→Wi-Fi, ucsi_*→USB-C. Meaningless labels (`temp1_input`, NVMe `Composite`) are dropped; `Package id 0`→`package`. Unknown drivers are capitalised, never invented. |
 | Hotkeys pinned | The hint bar moved out of the `ScrollView` and anchors to the window bottom; the scroll view now ends at `hintBar.top`. |
-| Disk health needing root | The probe now tries plain `smartctl`, then `sudo -n smartctl`, and reports which worked. SMART also enumerates **every** NVMe drive rather than a hard-coded `nvme0n1`. |
+| Disk health needing root | *(Describes the removed drive-health feature; see the banner at the top.)* The probe tried an unprivileged read first, fell back to an elevated one, and reported which had worked, enumerating every NVMe drive rather than a hard-coded first one. |
 | CPU model off the top | Moved into the CPU section beside the thread count. The top strip is now live stats: CPU / MEM / GPU / hottest TEMP / NET / UP. |
 | btop-style process data | The detail view gained executable path, working directory, thread and open-file counts, start time, and the full ancestry chain walking up to pid 1. |
 | Larger text | Every size goes through `root.fs(token)` with a `fontScale` (default `1.25`) in `manifest.panel.defaults` — one number rescales the panel. |
@@ -118,16 +118,25 @@ Instantaneous CPU has one side effect worth knowing: most processes sit at exact
 - Summary-strip spacing went to `Style.space(30)`, and section/column gaps opened up — six unrelated figures packed tight read as one run-on string.
 - Scrolling drives `scrollArea.contentItem.contentY` directly. Nudging `ScrollBar.position` was unreliable and left End/PageDown doing nothing. Cursor movement now calls `followCursor()`, which scrolls the focused section into view via registered anchors.
 
-### Permissions are now buttons, not instructions
+### Permissions were buttons, not instructions (removed 2026-09-02)
 
-Sections that need privilege render a plain-language line and an **Enable** button instead of a message telling you to go run something. The button shells out to `pkexec`, so the **polkit agent** raises its own password dialog — the panel never handles the credential, and nothing is granted silently.
+**This describes a subsystem that no longer exists.** Two optional sections
+once asked for a persistent privilege behind an in-panel consent button, one
+for per-process network attribution and one for drive health. Both features
+and the whole grant-and-revoke machinery around them were deleted; see the
+banner at the top of this document for what replaced them and why. The
+operational detail that used to sit here has gone with the code, since
+documenting how to use a removed feature is worse than not documenting it.
 
-- **Per-process network** → `pkexec setcap cap_net_raw,cap_net_admin+eip /usr/bin/bandwhich`
-- **Drive health** → writes `/etc/sudoers.d/10-sysmonitor-smartctl` granting exactly `smartctl -j -a /dev/nvme*n1`. It is written to a temp file and validated with `visudo -c` **before** being installed, because a malformed sudoers drop-in can lock `sudo` out entirely. A narrow rule beats adding the account to `disk`, which would grant raw read/write on every disk rather than one read-only command.
-
-`pkexec` exit codes 126 (dismissed) and 127 (not authorised) are treated as a decision, not an error — cancelling the prompt reports nothing. On success the capability probe re-runs and the section fills in without a restart.
-
-On this machine drive health already worked through a pre-existing passwordless sudo rule, so only the network button appears.
+What is worth keeping from the episode is the reasoning, not the commands.
+The design put a consent button in the panel rather than telling the reader
+to go run something themselves, raised the password prompt through the
+desktop's own authentication agent so the panel never handled a credential,
+and preferred a single narrow grant over adding the account to a group that
+would have opened far more than the one thing needed. That instinct was
+right. What it could not fix is that the feature still needed the privilege
+at all, and five rounds of adversarial review on the machinery kept finding
+worse defects in it, which is what eventually settled the question.
 
 ### v2.3 — round three
 
@@ -575,7 +584,7 @@ null
 `smartctl` is installed and on PATH, so a `command -v smartctl` gate **passes while the data never arrives** — the section would render permanently empty. Pick one of three resolutions before implementing:
 
 1. **Drop SMART, keep NVMe temperature (recommended for v1).** NVMe temps are already readable unprivileged from hwmon — `hwmon1` and `hwmon2` are both `nvme` (see 4.11). This loses wear-level / power-on-hours / media-errors but costs no privilege escalation and no new failure mode.
-2. **Grant a narrow sudoers exemption.** A `NOPASSWD` entry limited to `smartctl -j -a /dev/nvme0n1` and `/dev/nvme1n1`, invoked as `sudo -n smartctl ...`. Keep `-n` so a missing rule fails immediately instead of blocking on a password prompt inside the shell process.
+2. **Grant a narrow policy exemption.** A passwordless rule admitting only the one read-only SMART command against the two NVMe devices, invoked so a missing rule failed immediately rather than blocking on a password prompt inside the shell process. *(This is the option that was taken, and it is the one removed on 2026-09-02. Option 1 above is what the plugin does now, which makes this section's own recommendation the one that held up.)*
 3. **Out-of-band collection.** A systemd timer writes `smartctl -j` output to a world-readable cache file; the panel reads the file. Highest setup cost, cleanest privilege boundary, and the panel never spawns a privileged process.
 
 **`smartAvailable` must gate on a real probe, not `command -v`.** Run the actual command once on open and set the flag from the **exit code** (`0` = usable, `2` = permission denied), not from binary presence.
@@ -642,11 +651,7 @@ Process {
 
 **Fallback — bounded one-shot:** `timeout 2 bandwhich -r -p -i enp7s0` keeps the `StdioCollector` pattern by forcing an exit, at the cost of respawning every poll.
 
-**Privilege requirement (gates the whole section).** bandwhich needs `CAP_NET_RAW` + `CAP_NET_ADMIN` to capture. On this machine `getcap /usr/bin/bandwhich` returns **nothing** — no capabilities are set, so it cannot capture as an unprivileged user. Grant them once with:
-
-```bash
-sudo setcap cap_net_raw,cap_net_admin+eip /usr/bin/bandwhich
-```
+**Privilege requirement (gates the whole section).** bandwhich needs `CAP_NET_RAW` + `CAP_NET_ADMIN` to capture, which an unprivileged user does not have, so the entire section depended on granting the binary a file capability. *(This is exactly why the feature was removed on 2026-09-02: per-process bandwidth has no unprivileged equivalent on Linux, confirmed by checking that /proc/net/tcp carries queue depth rather than cumulative per-socket byte counters. See the banner at the top.)*
 
 **`bandwhichAvailable` must not be a `command -v` check.** `command -v bandwhich` succeeds on this machine even though capture fails, which would render a permanently empty section. Gate on an actual trial run — probe with `timeout 2 bandwhich -r -p -i <iface> >/dev/null 2>&1` and set the flag from the exit code, or check `getcap` output is non-empty. Set `bandwhichData` to `[]` and hide the sub-section when the probe fails.
 
@@ -998,8 +1003,8 @@ Column {
 
 **Trace is unavailable on this machine and must be cut or gated.** Two independent blockers:
 
-1. **`strace` is not installed.** `command -v strace` returns nothing. Install with `sudo pacman -S strace`.
-2. **`ptrace_scope` is `1`** (`/proc/sys/kernel/yama/ptrace_scope`). Even once installed, `strace -p <pid>` on a process that is not a descendant of the tracer fails with `EPERM` — which is every process in this list. It would need `sudo strace`, or `sysctl kernel.yama.ptrace_scope=0` (a system-wide security downgrade, not recommended).
+1. **`strace` is not installed.** `command -v strace` returns nothing, and installing it is a system package operation.
+2. **`ptrace_scope` is `1`** (`/proc/sys/kernel/yama/ptrace_scope`). Even once installed, `strace -p <pid>` on a process that is not a descendant of the tracer fails with `EPERM` — which is every process in this list. It would need to run elevated, or need `ptrace_scope` relaxed machine-wide, which is a system-wide security downgrade and not recommended.
 
 Either drop the Trace button from v1, or render it `enabled: false` with a tooltip stating why. Do not ship a button that silently opens a terminal showing a permission error.
 
