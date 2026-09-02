@@ -2104,8 +2104,10 @@ Item {
                   // this panel, not data arriving from a process/device/
                   // subprocess, a different trust level than the rest of
                   // this sweep. Still length-capped for defense in depth;
-                  // PanelActionButton's own tooltip Text already sets
-                  // Text.PlainText (checked directly in its source).
+                  // PanelActionButton renders tooltipText through its own
+                  // PanelToolTip child, whose Text already sets
+                  // Text.PlainText (checked directly in PanelToolTip.qml,
+                  // not assumed from PanelActionButton's own source alone).
                   tooltipText: root.processFilter !== ""
                                ? "Filtering “" + Model.truncateDisplay(root.processFilter, 100) + "” — click to edit (/)"
                                : "Search processes by name or pid (/)"
@@ -2346,9 +2348,9 @@ Item {
       // Disabled rather than left to fail: kill returns EPERM on another
       // user's process and the row merely not vanishing reads as a bug.
       enabled: pr.proc ? root.ownsProcess(pr.proc) : false
-      // Length-capped for defense in depth; PanelActionButton's own
-      // tooltip Text already sets Text.PlainText (checked directly in its
-      // source, not assumed).
+      // Length-capped for defense in depth; PanelActionButton renders
+      // tooltipText through its own PanelToolTip child, whose Text already
+      // sets Text.PlainText (checked directly in PanelToolTip.qml).
       tooltipText: pr.proc && root.ownsProcess(pr.proc)
                    ? "Terminate (SIGTERM)"
                    : "Owned by " + Model.truncateDisplay(pr.proc ? pr.proc.user : "", 64) + " — needs privileges"

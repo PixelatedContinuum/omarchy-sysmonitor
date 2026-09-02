@@ -471,22 +471,20 @@ function isValidIfaceName(name) {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,14}$/.test(String(name || ""))
 }
 
-// POSIX/useradd-style username shape: a lowercase letter or underscore,
-// then lowercase letters/digits/underscore/hyphen, with an optional
-// trailing $ (Samba machine accounts). Checked even though the value
-// normally comes straight from $USER for the already-logged-in account,
-// not attacker input in the ordinary case — the same reasoning as
-// isValidIfaceName above: relying on an upstream source's assumed-safe
-// character set is exactly the assumption that stops holding the moment
-// anything upstream changes. Here the value is concatenated directly into
-// a root-owned sudoers principal field (smartSudoersRule below), where a
-// `#`-comment or a second `ALL=(ALL) NOPASSWD:` clause smuggled through
-// the "username" would grant far more than the one narrow command this
-// plugin intends — and unlike a malformed sudoers line, an INJECTED one
-// is syntactically valid, so `visudo -cf` cannot catch it downstream.
+// Checked even though the value normally comes straight from $USER for
+// the already-logged-in account, not attacker input in the ordinary case,
+// the same reasoning as isValidIfaceName above: relying on an upstream
+// source's assumed-safe character set is exactly the assumption that
+// stops holding the moment anything upstream changes. Here the value is
+// concatenated directly into a root-owned sudoers principal field
+// (smartSudoersRule below), where a `#`-comment or a second
+// `ALL=(ALL) NOPASSWD:` clause smuggled through the "username" would
+// grant far more than the one narrow command this plugin intends, and
+// unlike a malformed sudoers line, an INJECTED one is syntactically
+// valid, so `visudo -cf` cannot catch it downstream.
 //
-// The shape matches useradd(8)'s own CAVEATS section (checked against the
-// actual man page on this system, not assumed): letters in EITHER case,
+// The shape matches useradd(8)'s own CAVEATS section, checked against the
+// actual man page on this system, not assumed: letters in EITHER case,
 // digits, underscore, dash, or dot; an optional trailing $; no leading
 // dash; not fully numeric; not literally "." or ".."; up to 256 chars. An
 // earlier, narrower version of this function (lowercase-only, no dots, 32
@@ -720,7 +718,19 @@ function buildGrantCapabilityScript(path, capString, backupPath) {
     "case \"$real\" in /usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*) : ;; *) exit 20 ;; esac; " +
     "[ -f \"$real\" ] && [ ! -L \"$real\" ] || exit 21; " +
     "[ \"$(stat -c '%U' -- \"$real\")\" = root ] || exit 22; " +
-    "old=$(getcap -- \"$real\" 2>/dev/null || true); " +
+    // getcap's own output is "PATH CAPSPEC", not a bare capability string
+    // (confirmed directly: `getcap -- /usr/bin/bandwhich` prints
+    // "/usr/bin/bandwhich cap_net_admin,cap_net_raw=eip"), and setcap
+    // refuses that whole line verbatim as its own first argument with a
+    // clean parse error. Storing getcap's raw output as the backup, then
+    // replaying it straight back into setcap on revoke, meant the restore
+    // path never actually worked in its own intended, legitimate case,
+    // found while checking a separate, adjacent concern, not by either
+    // adversarial pass. `${raw#"$real "}` strips the known prefix via
+    // parameter expansion, not a regex: the pattern is fully quoted, so a
+    // glob-special character anywhere in $real (verified with a literal
+    // `[...]` in a test path) is matched literally, not as a wildcard.
+    "raw=$(getcap -- \"$real\" 2>/dev/null || true); old=${raw#\"$real \"}; " +
     // This whole script runs as root (pkexec), and backupPath lives under
     // the invoking user's own writable home directory (see the comment
     // above), a directory the user, or anything running as them, could
@@ -771,8 +781,36 @@ function buildRevokeCapabilityScript(path, backupPath) {
     // symlink at all, same reasoning as the grant side above.
     "[ -f " + bp + " ] && [ ! -L " + bp + " ] || exit 23; " +
     "old=$(cat " + bp + " 2>/dev/null || true); " +
-    "if [ -n \"$old\" ]; then setcap \"$old\" -- \"$real\"; else setcap -r -- \"$real\" 2>/dev/null || true; fi; " +
-    "rm -f " + bp
+    // The symlink guard above protects the PATH; this protects the
+    // CONTENT. backupPath lives in a location this account can write to
+    // by design, so nothing stops it (or anything running as it) from
+    // overwriting the file directly with some other syntactically-shaped
+    // capability string, which an unguarded restore would hand straight
+    // to root's setcap. Real getcap output across this system (surveyed
+    // directly, not assumed: newgidmap, newuidmap, btop, rcp/rlogin/rsh,
+    // gsr-kms-server, bandwhich) is consistently "cap_name[,cap_name...]
+    // =flags" with no `+`/`-` and no spaces, so the charset check below
+    // allows exactly that range and refuses anything else. It is a shape
+    // filter, not a full parser: setcap's own parser, already proven
+    // strict (it rejects getcap's combined "path capspec" form outright),
+    // is what decides whether the surviving string is actually
+    // well-formed, the same division of labor visudo -cf has elsewhere in
+    // this codebase.
+    //
+    // rc is captured explicitly and exited at the end rather than left to
+    // whatever the trailing `rm -f` returns: `rm -f` on a file that is
+    // there almost always succeeds, so without this, a failed setcap
+    // (wrong privilege, or a charset-passing string setcap's own parser
+    // still rejects) would have reported success anyway, since cleanup
+    // ran last. Found while testing the fix above, not assumed correct
+    // because it looked like the (correct) shape already used in
+    // buildCollisionSafeInstallScript below.
+    "case \"$old\" in " +
+    "  '') setcap -r -- \"$real\" 2>/dev/null; rc=0 ;; " +
+    "  *[!A-Za-z0-9_,=]*) rc=26 ;; " +
+    "  *) setcap \"$old\" -- \"$real\"; rc=$? ;; " +
+    "esac; " +
+    "rm -f " + bp + "; exit $rc"
 }
 
 // Installs `content` at targetPath, but never as a blind overwrite:
@@ -798,8 +836,19 @@ function buildCollisionSafeInstallScript(targetPath, content, mode, owner, group
   // the same second used to reuse the same `.bak-$(date +%s)` name and the
   // second `cp -p` silently overwrote the first backup, exactly the
   // silent-overwrite this function exists to prevent.
+  //
+  // The `-L` check on the target itself is defense in depth rather than a
+  // response to a reachable path on this specific plugin's two callers
+  // (/usr/local/bin and /etc/sudoers.d are both root:root and not
+  // user-writable, checked directly, not assumed): if targetPath were
+  // ever a symlink, `cp -p` would read through it into the backup rather
+  // than recognizing it as one. `install`, the actual write at the end,
+  // already replaces a symlink destination rather than following it
+  // (verified directly, the same way `mv` does), so no equivalent guard
+  // is needed there.
   return "t=$(mktemp) && printf '%s' " + sq(String(content || "")) + " > \"$t\" && chmod " + m + " \"$t\" && " +
     validate +
+    "[ ! -L " + tp + " ] && " +
     "{ [ -e " + tp + " ] && ! cmp -s \"$t\" " + tp + " && bak=$(mktemp " + tp + ".bak-XXXXXX 2>/dev/null) && cp -p " + tp + " \"$bak\" 2>/dev/null; true; } && " +
     "install -m " + m + " -o " + o + " -g " + g + " \"$t\" " + tp + "; " +
     "rc=$?; rm -f \"$t\"; exit $rc"
