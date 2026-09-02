@@ -1138,17 +1138,48 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(16)
             anchors.rightMargin: Style.space(16)
-            implicitHeight: Math.max(titleText.implicitHeight, summaryRow.implicitHeight)
+            implicitHeight: Math.max(titleBlock.implicitHeight, summaryRow.implicitHeight)
 
-            Text {
-              id: titleText
+            // The machine's identity sits with the panel's name rather than
+            // buried in the CPU and GPU sections. Those two model lines used
+            // to live inside their own sections, which put the two halves of
+            // "what machine is this" a full column apart and spent a line of
+            // each section on something that never changes.
+            Column {
+              id: titleBlock
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              text: "System Monitor"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fsHeading
-              font.bold: true
+              spacing: Style.space(2)
+
+              Text {
+                id: titleText
+                text: "System Monitor"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fsHeading
+                font.bold: true
+              }
+
+              Text {
+                id: hardwareLine
+                // Hidden rather than elided once the window narrows: this is
+                // identity, not a live reading, so it is the first thing that
+                // should give up its space to the figures beside it.
+                visible: root.contentWidth >= 760 && text !== ""
+                textFormat: Text.PlainText
+                text: {
+                  var bits = []
+                  if (root.cpuModelShort !== "")
+                    bits.push(Model.truncateDisplay(root.cpuModelShort, 60))
+                  if (root.gpuModel !== "")
+                    bits.push(Model.truncateDisplay(root.gpuModel, 60))
+                  return bits.join("   ·   ")
+                }
+                color: root.dimmer
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fsCaption
+              }
             }
 
             Row {
@@ -1187,16 +1218,22 @@ Item {
                 warn: root.gpuUtil >= 90
                 ringColor: root.secGpu
               }
-              // Labelled TEMP rather than by device: with the device name as
-              // the label it renders a second "CPU" beside the usage stat and
-              // reads as a duplicate. The device belongs in the value.
+              // The CPU package specifically, not whichever sensor happens to
+              // be hottest. The hottest reading drifts between devices as
+              // load moves around, so the figure kept changing what it was
+              // measuring, and a temperature that silently switches subject
+              // is worse than one that is simply always the CPU. Whatever is
+              // actually hottest is still surfaced, in the THERMAL section's
+              // own heading, where the label says so.
+              //
+              // Labelled TEMP rather than CPU: the ring beside it is already
+              // labelled CPU, and two "CPU" labels side by side read as a
+              // duplicate. The device stays in the value.
               Stat {
-                visible: root.hottest !== null
+                visible: root.cpuTemp > 0
                 label: "TEMP"
-                value: root.hottest
-                       ? Model.truncateDisplay(root.hottest.display, 40) + " " + Model.formatTemp(root.hottest.tempC)
-                       : ""
-                warn: root.hottest ? root.hottest.tempC >= 80 : false
+                value: root.cpuTemp > 0 ? "CPU " + Model.formatTemp(root.cpuTemp) : ""
+                warn: root.cpuTemp >= 85
               }
               Stat {
                 visible: root.contentWidth >= 900
@@ -1579,13 +1616,15 @@ Item {
                 }
               }
 
+              // The CPU model moved up beside the panel title, with the GPU's.
+              // The thread count went with it only in spirit: it is already
+              // implied by the core grid directly above, which draws one block
+              // per thread.
               Text {
                 width: parent.width
-                visible: root.cpuModelShort !== ""
+                visible: root.cpuCorePercents.length > 0
                 textFormat: Text.PlainText
-                text: Model.truncateDisplay(root.cpuModelShort, 200)
-                      + (root.cpuCorePercents.length > 0
-                         ? "     " + root.cpuCorePercents.length + " threads" : "")
+                text: root.cpuCorePercents.length + " threads"
                 color: root.dimmer
                 elide: Text.ElideRight
                 font.family: root.fontFamily
@@ -1753,23 +1792,11 @@ Item {
                     fill: root.secGpu
                   }
 
-                  // The GPU's identity line, in the same position and the same
-                  // muted weight the CPU model takes under its core grid, and
-                  // paired with total VRAM the way the CPU model is paired
-                  // with its thread count. Hidden entirely when the name could
-                  // not be resolved rather than showing a raw PCI id.
-                  Text {
-                    width: parent.width
-                    visible: root.gpuModel !== ""
-                    textFormat: Text.PlainText
-                    text: Model.truncateDisplay(root.gpuModel, 200)
-                          + (root.gpuInfo && root.gpuInfo.vramTotal > 0
-                             ? "     " + Model.formatBytes(root.gpuInfo.vramTotal) : "")
-                    color: root.dimmer
-                    elide: Text.ElideRight
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fsCaption
-                  }
+                  // The GPU model moved up beside the panel title, with the
+                  // CPU's. Total VRAM stayed behind rather than following it:
+                  // the vram meter two rows above already states it, so
+                  // carrying it into the header would have duplicated a
+                  // figure rather than relocating one.
 
                   Text {
                     width: parent.width
@@ -2502,10 +2529,12 @@ Item {
   // repaint plumbing, and 60 of them redrawn on a 2s poll costs nothing next
   // to the Canvas rings that are already here.
   //
-  // Bars are positioned from the RIGHT, so the newest sample is always
-  // pinned to the right edge and a partially-filled buffer grows leftward
-  // into empty space rather than stretching to fill the width and rescaling
-  // itself every poll for the first two minutes.
+  // Bars run left to right, oldest to newest, the direction a chart is read.
+  // They were first anchored to the right edge so a partly-filled buffer grew
+  // leftward, which keeps the newest sample in one fixed place but means a
+  // warming-up graph builds backwards into empty space, and that reads wrong
+  // enough to be worth the trade. Once the buffer is full both behave
+  // identically: a new sample arrives at the right and the rest shift left.
   //
   // maxValue: 0 means autoscale to the tallest sample present, which is what
   // network throughput needs (a rate has no ceiling to scale against, and a
@@ -2547,21 +2576,19 @@ Item {
       model: spark.values.length
       delegate: Rectangle {
         required property int index
-        // Index counted back from the newest, so bar 0 sits at the right.
-        readonly property int fromEnd: spark.values.length - 1 - index
         readonly property real frac:
           Math.max(0, Math.min(1, spark.values[index] / spark.scale))
         width: Math.max(1, spark.slotWidth - 1)
         // Any non-zero sample gets at least 2px, so a low but real value is
         // still visible instead of rounding away to the baseline.
         height: frac > 0 ? Math.max(2, spark.height * frac) : 1
-        x: spark.width - (fromEnd + 1) * spark.slotWidth
+        x: index * spark.slotWidth
         y: spark.height - height
         radius: width > 2 ? 1 : 0
         color: spark.fill
         // Older samples fade, which reads as direction of time without
         // needing an axis or a label to say so.
-        opacity: 0.30 + 0.70 * (1 - fromEnd / Math.max(1, spark.slots - 1))
+        opacity: 0.30 + 0.70 * (index / Math.max(1, spark.values.length - 1))
       }
     }
   }
@@ -2584,8 +2611,11 @@ Item {
     spacing: Style.space(3)
 
     Item {
-      width: Style.space(34)
-      height: Style.space(34)
+      // Matched to the disk rings at 52, which were already the right size to
+      // read at a glance; at 34 these were the smallest gauges on a panel
+      // whose most-looked-at figures they happen to be.
+      width: Style.space(52)
+      height: Style.space(52)
       anchors.horizontalCenter: parent.horizontalCenter
 
       Canvas {
@@ -2621,7 +2651,10 @@ Item {
         text: Math.round(rstat.percent) + "%"
         color: rstat.warn ? root.urgent : root.foreground
         font.family: root.fontFamily
-        font.pixelSize: root.fsCaption
+        // Unlike the disk rings, which grew only to give their number more
+        // room, these grew so the number itself reads larger: they are the
+        // panel's headline figures and sat at caption size.
+        font.pixelSize: root.fsBody
         font.bold: true
       }
     }
