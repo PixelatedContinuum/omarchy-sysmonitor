@@ -16,8 +16,10 @@ import "Model.js" as Model
 // Notes for anyone editing this:
 //
 // 1. All parsing lives in Model.js and is tested under node
-//    (`node test-model.js` — 102 checks against this machine's real /proc,
-//    sysfs, ps and df output). This file is wiring and layout only.
+//    (`node test-model.js`, run against this machine's real /proc, sysfs,
+//    ps and df output, the check count grows with the file, so it is not
+//    repeated here where it would only go stale). This file is wiring and
+//    layout only.
 //
 // 2. One master tick drives every collector rather than eight independent
 //    Timers. Independent timers on 2s/3s/5s/10s periods align periodically
@@ -400,8 +402,16 @@ Item {
   }
 
   function openProcessLsof(pid) {
+    // Coerced for the same reason as killProcess/reniceProcess: this
+    // string is embedded into a shell script one layer downstream
+    // (omarchy-launch-floating-terminal-with-presentation's own
+    // `bash -c "$presentation_script"`), so a non-integer pid would reach
+    // shell interpretation rather than just being an odd lsof argument.
+    // The only current call site already passes a real integer.
+    var p = parseInt(pid, 10) || 0
+    if (p <= 0) return
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
-                             "lsof -p " + pid])
+                             "lsof -p " + p])
   }
 
   property string grantBusy: ""
@@ -443,6 +453,17 @@ Item {
 
   function grantSmart() {
     grantBusy = "smartctl"; grantError = ""; grantAction = "grant"
+    // Checked here, synchronously and before even the unprivileged binary
+    // check below, not just inside buildGrantSmartScript: that check alone
+    // meant an unusual-but-legitimate account name only surfaced its
+    // refusal AFTER pkexec had already prompted for and accepted a
+    // password, directly contradicting this same point's "before any
+    // password prompt" requirement for a value that fails validation.
+    if (!Model.isValidUsername(Quickshell.env("USER") || "")) {
+      grantBusy = ""
+      grantError = "not granted: could not validate the account name; no sudoers rule was written"
+      return
+    }
     grantValidateProc.pendingTarget = "smartctl"
     grantValidateProc.command = ["bash", "-c", Model.buildExecutableValidationScript("/usr/bin/smartctl")]
     grantValidateProc.running = true
@@ -1055,12 +1076,17 @@ Item {
         // docs recommend this exact setcap line as a manual step). Nothing
         // was touched; say so plainly rather than a bare exit code.
         root.grantError = "not revoked: this capability was not granted by this plugin, so there is nothing on file to safely restore"
-      } else if (exitCode === 24) {
+      } else if (exitCode === 24 && root.grantAction === "grant") {
         // Model.buildGrantSmartScript's own refusal: the account name read
         // from the environment did not pass Model.isValidUsername, so no
-        // sudoers rule was built at all. Surfacing this plainly matters
-        // more than most refusals here, since a rule built from that value
-        // would have been syntactically valid and passed visudo -cf clean.
+        // sudoers rule was built at all. grantSmart() already checks this
+        // synchronously before pkexec is ever invoked, so this branch is a
+        // second-layer defense (a $USER that changed between that check
+        // and this script running, or a future caller of
+        // buildGrantSmartScript that skips grantSmart()) rather than the
+        // normal path. Surfacing it plainly still matters, since a rule
+        // built from that value would have been syntactically valid and
+        // passed visudo -cf clean.
         root.grantError = "not granted: could not validate the account name; no sudoers rule was written"
       } else if (root.grantError === "") {
         root.grantError = (grantProc.pendingLabel || root.grantAction || "grant") + " failed (exit " + exitCode + ")"
@@ -2076,10 +2102,10 @@ Item {
                   iconText: "󰍉"
                   // processFilter is typed locally by whoever is sitting at
                   // this panel, not data arriving from a process/device/
-                  // subprocess — a different trust level than the rest of
-                  // this sweep. Still bounded before it reaches the external
-                  // tooltip renderer, for the same reason as everywhere else:
-                  // this call site cannot confirm that renderer's textFormat.
+                  // subprocess, a different trust level than the rest of
+                  // this sweep. Still length-capped for defense in depth;
+                  // PanelActionButton's own tooltip Text already sets
+                  // Text.PlainText (checked directly in its source).
                   tooltipText: root.processFilter !== ""
                                ? "Filtering “" + Model.truncateDisplay(root.processFilter, 100) + "” — click to edit (/)"
                                : "Search processes by name or pid (/)"
@@ -2320,10 +2346,9 @@ Item {
       // Disabled rather than left to fail: kill returns EPERM on another
       // user's process and the row merely not vanishing reads as a bug.
       enabled: pr.proc ? root.ownsProcess(pr.proc) : false
-      // PanelActionButton is a shared component outside this plugin, so
-      // whatever textFormat its own internal Text uses can't be set from
-      // here — bounding the string before it is handed over is what this
-      // call site can actually control.
+      // Length-capped for defense in depth; PanelActionButton's own
+      // tooltip Text already sets Text.PlainText (checked directly in its
+      // source, not assumed).
       tooltipText: pr.proc && root.ownsProcess(pr.proc)
                    ? "Terminate (SIGTERM)"
                    : "Owned by " + Model.truncateDisplay(pr.proc ? pr.proc.user : "", 64) + " — needs privileges"

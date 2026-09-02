@@ -484,8 +484,31 @@ function isValidIfaceName(name) {
 // the "username" would grant far more than the one narrow command this
 // plugin intends — and unlike a malformed sudoers line, an INJECTED one
 // is syntactically valid, so `visudo -cf` cannot catch it downstream.
+//
+// The shape matches useradd(8)'s own CAVEATS section (checked against the
+// actual man page on this system, not assumed): letters in EITHER case,
+// digits, underscore, dash, or dot; an optional trailing $; no leading
+// dash; not fully numeric; not literally "." or ".."; up to 256 chars. An
+// earlier, narrower version of this function (lowercase-only, no dots, 32
+// chars) rejected real Arch usernames like "John" or "john.doe", and
+// since none of the characters an injection actually needs (space, #, =,
+// parens, colon, slash) were ever in the useradd-allowed set to begin
+// with, that narrowing bought no extra safety, just false rejections.
 function isValidUsername(name) {
-  return /^[a-z_][a-z0-9_-]{0,31}\$?$/.test(String(name || ""))
+  var s = String(name || "")
+  if (s.length === 0 || s.length > 256) return false
+  if (s === "." || s === "..") return false
+  if (s.charAt(0) === "-") return false
+  if (!/^[A-Za-z0-9_.-]+\$?$/.test(s)) return false
+  var core = s.charAt(s.length - 1) === "$" ? s.slice(0, -1) : s
+  if (/^[0-9]+$/.test(core)) return false   // "fully numeric" usernames are disallowed
+  // ALL is composed entirely of letters useradd would happily accept, but
+  // in the User_List position of a sudoers rule specifically, ALL is a
+  // reserved alias meaning "every user on the system", not a name at
+  // all. No real useradd-created account is named exactly this, so
+  // rejecting it costs nothing and closes the one case where a
+  // "syntactically fine as a username" value still broadens the grant.
+  return core !== "ALL"
 }
 
 // Bounds a string before it reaches a Text element, for every value on this
@@ -691,13 +714,31 @@ function parseExecutableValidation(output) {
 // system configuration.
 function buildGrantCapabilityScript(path, capString, backupPath) {
   var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  var bp = sq(String(backupPath || ""))
+  var bdir = sq(String(backupPath || "").replace(/\/[^/]*$/, ""))
   return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
     "case \"$real\" in /usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*) : ;; *) exit 20 ;; esac; " +
     "[ -f \"$real\" ] && [ ! -L \"$real\" ] || exit 21; " +
     "[ \"$(stat -c '%U' -- \"$real\")\" = root ] || exit 22; " +
     "old=$(getcap -- \"$real\" 2>/dev/null || true); " +
-    "mkdir -p -- " + sq(String(backupPath || "").replace(/\/[^/]*$/, "")) + "; " +
-    "printf '%s' \"$old\" > " + sq(String(backupPath || "")) + "; " +
+    // This whole script runs as root (pkexec), and backupPath lives under
+    // the invoking user's own writable home directory (see the comment
+    // above), a directory the user, or anything running as them, could
+    // have pre-planted a symlink in. `printf > backupPath` would follow
+    // that symlink and let a root-privileged write land wherever it
+    // points. `-L` (not `-e`) is what actually catches this: `-e` follows
+    // a symlink to check whether ITS TARGET exists, so a dangling symlink
+    // reads as "nothing here yet" and would sail through an `-e`-based
+    // check straight into mkdir/the write. `-L` uses lstat semantics and
+    // reports "this path is a symlink" regardless of whether it resolves.
+    // Verified directly: a plain `>` redirect follows a symlink to its
+    // target, and `mv` replaces the symlink itself instead of writing
+    // through it, so the actual write goes through a freshly mktemp'd file
+    // and mv, not a redirect into the destination path.
+    "[ ! -L " + bdir + " ] || exit 25; " +
+    "mkdir -p -- " + bdir + " || exit 25; " +
+    "[ ! -L " + bp + " ] || exit 25; " +
+    "bt=$(mktemp) && printf '%s' \"$old\" > \"$bt\" && mv -f \"$bt\" " + bp + " && " +
     "setcap " + sq(String(capString || "")) + " -- \"$real\""
 }
 
@@ -722,7 +763,13 @@ function buildRevokeCapabilityScript(path, backupPath) {
   var bp = sq(String(backupPath || ""))
   return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
     "[ -n \"$real\" ] || exit 20; " +
-    "[ -f " + bp + " ] || exit 23; " +
+    // `-f` alone is not enough: it follows a symlink to check whether ITS
+    // TARGET is a regular file, so a symlink planted at backupPath
+    // pointing at some other regular file would still pass `-f` and get
+    // `cat`'d, feeding root's setcap whatever that file holds. `-L`
+    // (lstat, does not follow) refuses outright if backupPath is a
+    // symlink at all, same reasoning as the grant side above.
+    "[ -f " + bp + " ] && [ ! -L " + bp + " ] || exit 23; " +
     "old=$(cat " + bp + " 2>/dev/null || true); " +
     "if [ -n \"$old\" ]; then setcap \"$old\" -- \"$real\"; else setcap -r -- \"$real\" 2>/dev/null || true; fi; " +
     "rm -f " + bp
@@ -805,7 +852,13 @@ function smartHelperScript(smartctlPath) {
 // sudoers content that visudo -cf cannot distinguish from a real one.
 function smartSudoersRule(username) {
   if (!isValidUsername(username)) return ""
-  return String(username) + " ALL=(root) NOPASSWD: " + SMART_HELPER_PATH + "\n"
+  // A Cmnd with no argument spec at all lets the invoking user run it with
+  // ANY arguments they choose (sudoers(5)); the helper itself ignores
+  // $@, so this was not currently exploitable, but "no arguments at all"
+  // was a claim the rule did not actually enforce. The trailing `""` is
+  // sudoers' own syntax for "no arguments accepted", verified against the
+  // real visudo -cf on this system.
+  return String(username) + " ALL=(root) NOPASSWD: " + SMART_HELPER_PATH + " \"\"\n"
 }
 
 // Full grant script: install the helper (0755, root:root) then the

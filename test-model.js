@@ -176,22 +176,31 @@ section("isValidUsername — the gate before an account name reaches a sudoers p
 check("accepts ordinary usernames",
       ["jharrison", "root", "_apt", "www-data", "user123", "a", "user-name"]
         .every(function(n) { return M.isValidUsername(n) }))
+check("accepts what useradd(8) itself allows but an earlier, narrower version of this validator rejected: uppercase, dots, a leading digit",
+      ["John", "john.doe", "4nd", "UPPER", "mixedCase.name"]
+        .every(function(n) { return M.isValidUsername(n) }))
 check("accepts a trailing $ (Samba machine account convention)",
-      M.isValidUsername("workstation$"))
-check("accepts the maximum length (32 chars)",
-      M.isValidUsername("a" + "b".repeat(31)))
+      M.isValidUsername("workstation$") && M.isValidUsername("John$"))
+check("accepts the useradd(8) maximum length (256 chars)",
+      M.isValidUsername("a" + "b".repeat(255)))
 check("rejects one character over the maximum length",
-      !M.isValidUsername("a" + "b".repeat(32)))
+      !M.isValidUsername("a" + "b".repeat(256)))
+check("rejects a leading dash (the one leading character useradd(8) specifically disallows)",
+      !M.isValidUsername("-user"))
+check("rejects a fully numeric name, with or without the trailing $, per useradd(8)",
+      !M.isValidUsername("12345") && !M.isValidUsername("12345$") && M.isValidUsername("4nd"))
+check("rejects literal . and .. specifically",
+      !M.isValidUsername(".") && !M.isValidUsername(".."))
 check("rejects the exact sudoers-injection string this validator exists to stop",
       !M.isValidUsername("bad ALL=(ALL) NOPASSWD: /bin/bash #"))
-check("rejects shell/sudoers metacharacters generally",
+check("rejects shell/sudoers metacharacters generally, none of these are in useradd's own allowed set either",
       ["user name", "user;id", "user#comment", "user\nALL=(ALL)", "user'quote", "user\"quote",
-       "user`id`", "user$(id)", "ALL", "user ALL=(ALL) NOPASSWD: /bin/bash"]
+       "user`id`", "user$(id)", "user ALL=(ALL) NOPASSWD: /bin/bash"]
         .every(function(n) { return !M.isValidUsername(n) }))
+check("rejects the bare sudoers reserved word ALL, even though it is otherwise a shape useradd would accept",
+      !M.isValidUsername("ALL") && !M.isValidUsername("ALL$"))
 check("rejects empty, null, and non-string input",
       !M.isValidUsername("") && !M.isValidUsername(null) && !M.isValidUsername(undefined))
-check("rejects uppercase and a name starting with a digit or hyphen",
-      !M.isValidUsername("Jharrison") && !M.isValidUsername("1user") && !M.isValidUsername("-user"))
 check("live: the actual account this suite is running as passes the validator", (function() {
   var me = (sh("whoami") || "").trim()
   if (!me) return true
@@ -483,6 +492,16 @@ check("the sudoers rule names the fixed helper path and carries no wildcard or g
         return rule.indexOf(M.SMART_HELPER_PATH) >= 0
             && rule.indexOf("*") < 0 && rule.indexOf("?") < 0 && rule.indexOf("nvme") < 0
       })())
+check("the sudoers rule's Cmnd carries an explicit empty-argument spec, so 'no arguments' is enforced by the rule and not only by the helper ignoring $@",
+      (function() {
+        // sudoers(5): "If no command line arguments are specified, the
+        // user may run the command with any arguments they choose." A
+        // rule with nothing after the path does NOT mean "no arguments";
+        // it means "any arguments". "" is sudoers' own syntax for
+        // requiring none.
+        var rule = M.smartSudoersRule("someuser")
+        return rule.indexOf(M.SMART_HELPER_PATH + " \"\"") >= 0
+      })())
 check("the sudoers rule passes visudo -cf, the same authoritative gate the original code used",
       (function() {
         var p = "/tmp/sysmonitor-test-sudoers-syntax"
@@ -598,6 +617,61 @@ check("the grant script's own path guard rejects a target outside trusted direct
         var built = M.buildGrantCapabilityScript("/tmp/sysmonitor-test-not-a-real-target", "cap_net_raw+eip", "/tmp/sysmonitor-test-x.bak")
         var r = runScript(built)
         return !r.ok && r.status === 20   // our own guard, not a setcap/permission failure downstream
+      })())
+check("live: grant refuses (exit 25) when the backup path is a pre-planted symlink, and never writes through it",
+      (function() {
+        var protectedFile = "/tmp/sysmonitor-test-symlink-victim-" + process.pid
+        var backupPath = "/tmp/sysmonitor-test-symlink-backup-" + process.pid
+        fs.writeFileSync(protectedFile, "PROTECTED-ORIGINAL")
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        fs.symlinkSync(protectedFile, backupPath)
+        var r = runScript(M.buildGrantCapabilityScript("/usr/bin/bash", "cap_net_raw+eip", backupPath))
+        var untouched = fs.readFileSync(protectedFile, "utf8") === "PROTECTED-ORIGINAL"
+        var stillSymlink = fs.lstatSync(backupPath).isSymbolicLink()
+        fs.unlinkSync(protectedFile); fs.unlinkSync(backupPath)
+        return !r.ok && r.status === 25 && untouched && stillSymlink
+      })())
+check("live: grant refuses (exit 25) when the backup's CONTAINING DIRECTORY is a pre-planted symlink",
+      (function() {
+        var protectedFile = "/tmp/sysmonitor-test-symlink-victim2-" + process.pid
+        var backupDir = "/tmp/sysmonitor-test-symlink-dir-" + process.pid
+        fs.writeFileSync(protectedFile, "PROTECTED-2")
+        try { fs.unlinkSync(backupDir) } catch (e) {}
+        fs.symlinkSync("/tmp", backupDir)   // points somewhere real, not this specific file
+        var r = runScript(M.buildGrantCapabilityScript("/usr/bin/bash", "cap_net_raw+eip", backupDir + "/" + protectedFile.split("/").pop()))
+        var untouched = fs.readFileSync(protectedFile, "utf8") === "PROTECTED-2"
+        fs.unlinkSync(protectedFile); fs.unlinkSync(backupDir)
+        return !r.ok && r.status === 25 && untouched
+      })())
+check("live: grant succeeds normally against a non-symlinked backup path (the guards do not false-positive on the happy path)",
+      (function() {
+        var backupDir = "/tmp/sysmonitor-test-legit-dir-" + process.pid
+        var backupPath = backupDir + "/cap.bak"
+        try { fs.rmSync(backupDir, { recursive: true, force: true }) } catch (e) {}
+        var r = runScript(M.buildGrantCapabilityScript("/usr/bin/bash", "cap_net_raw+eip", backupPath))
+        // Expected to fail at the real setcap (unprivileged in this test
+        // run), NOT at any of our own guards (20-25): proving the backup
+        // itself got written cleanly before that final, expected failure.
+        var backupWritten = fs.existsSync(backupPath)
+        fs.rmSync(backupDir, { recursive: true, force: true })
+        return !r.ok && r.status !== 20 && r.status !== 21 && r.status !== 22 && r.status !== 25 && backupWritten
+      })())
+check("live: revoke refuses (exit 23, its existing no-backup code) when the backup path is a symlink to a real file, not just when nothing is there",
+      (function() {
+        // -f alone follows a symlink to check its TARGET's type, so a
+        // symlink to a real file would pass a bare -f check; -L is what
+        // actually catches this. Confirms the read side got the same
+        // defense as the write side, not just a re-verification of the
+        // write side under a different name.
+        var attackerFile = "/tmp/sysmonitor-test-symlink-readsrc-" + process.pid
+        var backupPath = "/tmp/sysmonitor-test-symlink-readbak-" + process.pid
+        fs.writeFileSync(attackerFile, "cap_sys_admin+eip")   // attacker-chosen "capability"
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        fs.symlinkSync(attackerFile, backupPath)
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        var symlinkUntouched = fs.lstatSync(backupPath).isSymbolicLink()
+        fs.unlinkSync(attackerFile); fs.unlinkSync(backupPath)
+        return !r.ok && r.status === 23 && symlinkUntouched
       })())
 check("revoke refuses (exit 23) when no backup file exists, rather than stripping a capability this plugin never granted",
       (function() {
