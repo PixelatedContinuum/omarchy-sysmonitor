@@ -607,6 +607,57 @@ check("parseGpuBusy handles empty input", M.parseGpuBusy("") === 0)
 check("parseMilliCelsius converts millidegrees", M.parseMilliCelsius("46000") === 46)
 
 // ------------------------------------------------------------------ GPU detail
+section("GPU model — live pci.ids lookup")
+check("parseGpuModel prefers the bracketed marketing name over the silicon codename",
+      M.parseGpuModel("Navi 21 [Radeon RX 6900 XT]") === "Radeon RX 6900 XT"
+      && M.parseGpuModel("GA102 [GeForce RTX 3090]") === "GeForce RTX 3090")
+check("parseGpuModel passes an unbracketed name through unchanged",
+      M.parseGpuModel("AlderLake-S GT1") === "AlderLake-S GT1")
+check("parseGpuModel returns empty for empty, null and whitespace input",
+      M.parseGpuModel("") === "" && M.parseGpuModel(null) === ""
+      && M.parseGpuModel(undefined) === "" && M.parseGpuModel("   \n ") === "")
+check("collectGpuModel refuses to build a command with no path",
+      M.collectGpuModel("") === "true" && M.collectGpuModel(null) === "true")
+var gpuModelPath = (sh(M.COLLECT_GPU_PATH) || "").trim()
+if (!gpuModelPath) skipped("live GPU model lookup", "no AMD GPU on this machine")
+else if (!fs.existsSync("/usr/share/hwdata/pci.ids")) skipped("live GPU model lookup", "hwdata pci.ids not installed")
+else {
+  var rawModel = sh(M.collectGpuModel(gpuModelPath)) || ""
+  check("live: the pci.ids lookup resolves this machine's card to a non-empty name",
+        M.parseGpuModel(rawModel).length > 0, "got " + JSON.stringify(rawModel.trim()))
+  check("live: the resolved name carries no leftover brackets or PCI id digits",
+        (function() {
+          var n = M.parseGpuModel(rawModel)
+          return n.indexOf("[") < 0 && n.indexOf("]") < 0 && !/^[0-9a-f]{4}$/.test(n)
+        })())
+}
+
+section("Theme palette — live colors.toml")
+check("parseThemePalette pulls hex colours out of key = \"#rrggbb\" lines",
+      (function() {
+        var p = M.parseThemePalette('mode = "dark"\naccent = "#58a6ff"\ngreen = "#4ade80"\n')
+        return p.accent === "#58a6ff" && p.green === "#4ade80" && p.mode === undefined
+      })())
+check("parseThemePalette ignores non-colour values rather than guessing at them",
+      (function() {
+        var p = M.parseThemePalette('mode = "dark"\nborder = "#58a6ff #1f6feb 45deg"\nx = 3\n')
+        return Object.keys(p).length === 0
+      })())
+check("parseThemePalette returns an empty object for empty, null and garbage input",
+      Object.keys(M.parseThemePalette("")).length === 0
+      && Object.keys(M.parseThemePalette(null)).length === 0
+      && Object.keys(M.parseThemePalette("  nonsense")).length === 0)
+var paletteRaw = sh(M.COLLECT_THEME_PALETTE) || ""
+if (!paletteRaw.trim()) skipped("live theme palette", "no colors.toml for the active theme")
+else {
+  var livePalette = M.parseThemePalette(paletteRaw)
+  check("live: the active theme yields a foreground and an accent",
+        !!livePalette.foreground && !!livePalette.accent,
+        "keys=" + Object.keys(livePalette).length)
+  check("live: every parsed value is a 6-digit hex colour",
+        Object.keys(livePalette).every(function(k) { return /^#[0-9a-fA-F]{6}$/.test(livePalette[k]) }))
+}
+
 section("GPU detail — live sysfs")
 var gpuPath = (sh(M.COLLECT_GPU_PATH) || "").trim()
 if (!gpuPath) skipped("parseGpuDetail", "no AMD GPU on this machine")

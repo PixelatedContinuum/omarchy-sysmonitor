@@ -87,6 +87,35 @@ Item {
   readonly property color urgent: Color.urgent
   readonly property color dim: Qt.darker(Color.foreground, 1.45)
   readonly property color dimmer: Qt.darker(Color.foreground, 1.75)
+
+  // The active theme's own named hues, read from its colors.toml (see
+  // Model.COLLECT_THEME_PALETTE for why that file is read directly rather
+  // than taken from the Color singleton, which keeps only four of its
+  // values). Empty until themeProc returns, so every reader goes through
+  // themeColor() and names the fallback it wants until then.
+  property var themePalette: ({})
+  function themeColor(key, fallback) {
+    var v = themePalette[key]
+    return v ? v : fallback
+  }
+
+  // One colour per section heading. Every title was the same accent blue,
+  // which made six headings read as one continuous list rather than as the
+  // boundaries between six different things. The hues and their order follow
+  // the topic rotation on the site this panel's styling is based on, mapped
+  // onto whatever the current theme calls those colours so switching themes
+  // recolours the panel with it instead of stranding a hardcoded palette.
+  //
+  // Red is deliberately not in the rotation: it is the alert colour here
+  // (root.urgent, for a hot drive or a saturated core), and a heading
+  // permanently painted in it would blunt that signal.
+  readonly property color secCpu: themeColor("blue", accent)
+  readonly property color secMem: themeColor("green", accent)
+  readonly property color secGpu: themeColor("magenta", accent)
+  readonly property color secDisk: themeColor("cyan", accent)
+  readonly property color secNet: themeColor("orange", accent)
+  readonly property color secProc: themeColor("yellow", accent)
+
   // Monospace throughout: this is a wall of numbers, and proportional digits
   // make the columns jitter as values change.
   readonly property string fontFamily: "monospace"
@@ -124,6 +153,7 @@ Item {
   property var diskData: []
 
   property string gpuPath: ""
+  property string gpuModel: ""          // marketing name, the GPU's counterpart to cpuModel
   property int gpuUtil: 0
   property real gpuTemp: 0
   property var gpuInfo: null           // full readout — VRAM, power, clocks, temps
@@ -522,6 +552,8 @@ Item {
   function collectorByName(name) {
     switch (name) {
       case "gpuDetectProc": return gpuDetectProc
+      case "gpuModelProc": return gpuModelProc
+      case "themeProc": return themeProc
       case "staticInfoProc": return staticInfoProc
       case "cpuProc": return cpuProc
       case "loadProc": return loadProc
@@ -624,6 +656,7 @@ Item {
       procTicksPrev = null
       start(gpuDetectProc, "gpuDetectProc")
       start(staticInfoProc, "staticInfoProc")
+      start(themeProc, "themeProc")
       runCollectors(true)
     } else {
       collectorStarts = {}
@@ -636,7 +669,34 @@ Item {
     command: Model.wrapCollectorCommand(Model.COLLECT_GPU_PATH, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.gpuPath = String(text || "").trim()
+      onStreamFinished: {
+        root.gpuPath = String(text || "").trim()
+        // The model name needs the path this just found, and never changes
+        // afterwards, so it is chained here rather than polled.
+        if (root.gpuPath !== "") root.start(gpuModelProc, "gpuModelProc")
+      }
+    }
+  }
+
+  // Static, so it runs once off the back of gpuDetectProc rather than on the
+  // collector timer. A machine with no AMD card never starts it at all.
+  Process {
+    id: gpuModelProc
+    command: Model.wrapCollectorCommand(Model.collectGpuModel(root.gpuPath), Model.OUTPUT_CAP_TINY)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.gpuModel = Model.parseGpuModel(text)
+    }
+  }
+
+  // Also static: the theme only changes on an explicit switch, which restarts
+  // the shell anyway, so one read at open is enough.
+  Process {
+    id: themeProc
+    command: Model.wrapCollectorCommand(Model.COLLECT_THEME_PALETTE, Model.OUTPUT_CAP_MEDIUM)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.themePalette = Model.parseThemePalette(text)
     }
   }
 
@@ -1376,6 +1436,7 @@ Item {
               SectionHeader {
                 width: parent.width
                 title: "CPU"
+                titleColor: root.secCpu
                 Component.onCompleted: root.registerAnchor("cpu", this)
                 value: (root.cpuTemp > 0 ? Model.formatTemp(root.cpuTemp) + "     " : "")
                        + (root.cpuPrimed ? Model.formatPercent(root.cpuTotalPercent) : "--")
@@ -1443,7 +1504,7 @@ Item {
                        + root.loadInfo.total + " running"
                   return t
                 }
-                color: root.dimmer
+                color: root.foreground
                 elide: Text.ElideRight
                 font.family: root.fontFamily
                 font.pixelSize: root.fsSmall
@@ -1472,6 +1533,7 @@ Item {
                   SectionHeader {
                     width: parent.width
                     title: "MEMORY"
+                    titleColor: root.secMem
                     Component.onCompleted: root.registerAnchor("memory", this)
                     value: root.memInfo
                            ? Model.formatBytes(root.memInfo.memTotal - root.memInfo.memAvail)
@@ -1505,7 +1567,7 @@ Item {
                             + Model.formatBytes(root.zramInfo.comprSize) + "   ("
                             + Model.formatCompressionRatio(root.zramInfo.origSize,
                                                            root.zramInfo.comprSize) + ")" : ""
-                    color: root.dimmer
+                    color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: root.fsSmall
                   }
@@ -1520,6 +1582,7 @@ Item {
                     width: parent.width
                     visible: root.gpuPath !== ""
                     title: "GPU"
+                    titleColor: root.secGpu
                     Component.onCompleted: root.registerAnchor("gpu", this)
                     value: root.gpuInfo
                            ? Model.formatWatts(root.gpuInfo.watts) + " / "
@@ -1572,6 +1635,24 @@ Item {
                     detail: root.gpuInfo ? Model.formatWatts(root.gpuInfo.watts) : ""
                   }
 
+                  // The GPU's identity line, in the same position and the same
+                  // muted weight the CPU model takes under its core grid, and
+                  // paired with total VRAM the way the CPU model is paired
+                  // with its thread count. Hidden entirely when the name could
+                  // not be resolved rather than showing a raw PCI id.
+                  Text {
+                    width: parent.width
+                    visible: root.gpuModel !== ""
+                    textFormat: Text.PlainText
+                    text: Model.truncateDisplay(root.gpuModel, 200)
+                          + (root.gpuInfo && root.gpuInfo.vramTotal > 0
+                             ? "     " + Model.formatBytes(root.gpuInfo.vramTotal) : "")
+                    color: root.dimmer
+                    elide: Text.ElideRight
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fsCaption
+                  }
+
                   Text {
                     width: parent.width
                     visible: root.gpuInfo !== null
@@ -1591,7 +1672,7 @@ Item {
                       if (root.gpuInfo.fanRpm > 0) bits.push(root.gpuInfo.fanRpm + " RPM")
                       return bits.join("     ")
                     }
-                    color: root.dimmer
+                    color: root.foreground
                     elide: Text.ElideRight
                     font.family: root.fontFamily
                     font.pixelSize: root.fsCaption
@@ -1613,7 +1694,7 @@ Item {
                       return bits.join("     ")
                     }
                     color: root.gpuInfo && root.gpuInfo.temps.some(function(t) {
-                             return t.tempC >= 90 }) ? root.urgent : root.dimmer
+                             return t.tempC >= 90 }) ? root.urgent : root.foreground
                     elide: Text.ElideRight
                     font.family: root.fontFamily
                     font.pixelSize: root.fsCaption
@@ -1639,6 +1720,7 @@ Item {
                   SectionHeader {
                     width: parent.width
                     title: "DISK"
+                    titleColor: root.secDisk
                     Component.onCompleted: root.registerAnchor("disk", this)
                     value: root.diskData.length + " filesystems"
                   }
@@ -1668,7 +1750,7 @@ Item {
                       // NVMe controllers throttle in the high seventies, so
                       // 70 is the point where the number is worth noticing
                       // rather than an alarm in itself.
-                      color: modelData.tempC >= 70 ? root.urgent : root.dimmer
+                      color: modelData.tempC >= 70 ? root.urgent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: root.fsCaption
                       elide: Text.ElideRight
@@ -1680,6 +1762,7 @@ Item {
                   SectionHeader {
                     width: parent.width
                     title: "NETWORK"
+                    titleColor: root.secNet
                     Component.onCompleted: root.registerAnchor("network", this)
                     // Length-capped here for defense in depth; the value
                     // Text this feeds (SectionHeader's shVal, defined lower
@@ -1720,7 +1803,10 @@ Item {
                              + (root.processView.length === 1 ? " MATCH)" : " MATCHES)")
                            : "")
                   Component.onCompleted: root.registerAnchor("processes", this)
-                  foreground: root.accent
+                  // Not a SectionHeader (it carries its own paused/filter
+                  // state and sits beside the action buttons), so it takes
+                  // its section colour directly.
+                  foreground: root.secProc
                   fontFamily: root.fontFamily
                   fontSize: root.fsBody
                 }
@@ -2041,7 +2127,7 @@ Item {
       horizontalAlignment: Text.AlignRight
       text: pr.proc && pr.proc.elapsed !== undefined
             ? Model.formatElapsed(pr.proc.elapsed) : ""
-      color: root.dimmer
+      color: root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
     }
     Text {
@@ -2053,7 +2139,7 @@ Item {
       width: visible ? root.colThreads : 0
       horizontalAlignment: Text.AlignRight
       text: pr.proc && pr.proc.threads ? String(pr.proc.threads) : ""
-      color: root.dimmer
+      color: root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
     }
     Text {
@@ -2077,7 +2163,7 @@ Item {
       visible: root.showProcState
       width: visible ? root.colState : 0
       text: pr.proc ? Model.formatState(pr.proc.stat).split(" (")[0] : ""
-      color: root.dimmer
+      color: root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
       elide: Text.ElideRight
     }
@@ -2090,7 +2176,9 @@ Item {
       width: visible ? root.colUser : 0
       textFormat: Text.PlainText
       text: pr.proc ? Model.truncateDisplay(pr.proc.user, 64) : ""
-      color: pr.proc && root.ownsProcess(pr.proc) ? root.dim : root.dimmer
+      // Your own processes read at full brightness; another user's stay
+      // muted, since they are the ones you cannot act on.
+      color: pr.proc && root.ownsProcess(pr.proc) ? root.foreground : root.dimmer
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
       elide: Text.ElideRight
     }
@@ -2103,7 +2191,7 @@ Item {
       width: visible ? root.colPid : 0
       horizontalAlignment: Text.AlignRight
       text: pr.proc ? String(pr.proc.pid) : ""
-      color: root.dim
+      color: root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
     }
     Text {
@@ -2178,7 +2266,7 @@ Item {
           anchors.right: parent.right
           textFormat: Text.PlainText
           text: dr.disk ? Model.truncateDisplay(dr.disk.used, 20) + " / " + Model.truncateDisplay(dr.disk.size, 20) : ""
-          color: root.dim
+          color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: root.fsSmall
         }
@@ -2311,7 +2399,7 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       visible: cell.present
       text: cell.pct + "%"
-      color: root.dim
+      color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: root.fsSmall
     }
@@ -2321,17 +2409,22 @@ Item {
     id: sh
     property string title: ""
     property string value: ""
+    // Defaults to the accent so a heading that forgets to name a colour still
+    // renders as it always did, rather than as an invalid colour.
+    property color titleColor: root.accent
     implicitHeight: Math.max(shHdr.implicitHeight, shVal.implicitHeight)
 
-    // Section titles take the theme accent and a larger size. Previously they
-    // were the same dim grey at the same size as the values beside them, so
-    // headings and data read as one undifferentiated wall.
+    // Section titles take their section's own colour and a larger size.
+    // Previously they were the same dim grey at the same size as the values
+    // beside them, so headings and data read as one undifferentiated wall;
+    // then they were all one accent blue, which separated heading from data
+    // but not one section from the next.
     PanelSectionHeader {
       id: shHdr
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter
       text: sh.title
-      foreground: root.accent
+      foreground: sh.titleColor
       fontFamily: root.fontFamily
       fontSize: root.fsBody
     }
@@ -2353,7 +2446,7 @@ Item {
       // this value.
       textFormat: Text.PlainText
       text: sh.value
-      color: root.dim
+      color: root.foreground
       elide: Text.ElideRight
       font.family: root.fontFamily
       font.pixelSize: root.fsSmall
@@ -2436,7 +2529,7 @@ Item {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       text: lm.detail
-      color: root.dim
+      color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: root.fsSmall
     }

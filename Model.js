@@ -62,6 +62,77 @@ var COLLECT_GPU_PATH =
     'fi; ' +
   'done'
 
+// The active theme's full colour palette. The shell's own Color singleton
+// reads this same file but keeps only four values from it (foreground,
+// background, accent, and red mapped to urgent), so the named hues a theme
+// also defines (green, yellow, cyan, magenta, orange) are not reachable
+// through it. This panel wants them to colour section headings apart from
+// each other, so it reads the file itself.
+//
+// The path is the theme symlink Omarchy maintains, and colors.toml ships with
+// every theme (checked: all 22 installed here), so this is a plain
+// world-readable file read with a graceful empty result if it is ever absent.
+var COLLECT_THEME_PALETTE =
+  'cat "$HOME/.local/state/omarchy/current/theme/colors.toml" 2>/dev/null || true'
+
+// Pulls `key = "#rrggbb"` pairs out of colors.toml. Deliberately not a real
+// TOML parser: the file is flat key/value with no tables or arrays, and the
+// only values this cares about are hex colours, so anything that is not a
+// plain hex string is skipped rather than guessed at. A theme that omits a
+// key simply does not get an entry, and the panel falls back per-key.
+function parseThemePalette(raw) {
+  var out = {}
+  var lines = _lines(raw)
+  for (var i = 0; i < lines.length; i++) {
+    var m = String(lines[i]).match(/^\s*([a-z_]+)\s*=\s*"(#[0-9a-fA-F]{6})"\s*$/)
+    if (m) out[m[1]] = m[2]
+  }
+  return out
+}
+
+// The GPU's marketing name, the counterpart to the CPU's "model name" line
+// from /proc/cpuinfo. The kernel does not publish one: sysfs carries only the
+// numeric PCI vendor and device ids, so the name has to be looked up in
+// hwdata's pci.ids, the same table `lspci` itself reads. Reading that file
+// directly rather than shelling out to lspci keeps this a plain
+// world-readable file read with no extra binary to depend on.
+//
+// pci.ids is indented by tab depth: vendors at column 0, devices one tab in,
+// subsystem entries two tabs in. The awk below walks into the right vendor
+// block, then the right device line, and prefers a subsystem match when the
+// card has one (those name the specific board) while falling back to the
+// generic device name when it does not. This machine's card has no subsystem
+// entry, checked directly, so the fallback is the path actually exercised
+// here. Missing file, missing ids or an unknown card all end as empty output,
+// which the panel renders as no model line at all rather than an error.
+function collectGpuModel(gpuPath) {
+  var g = String(gpuPath || "").replace(/'/g, "")
+  if (!g) return "true"
+  return "v=$(cat '" + g + "/vendor' 2>/dev/null); d=$(cat '" + g + "/device' 2>/dev/null); " +
+    "sv=$(cat '" + g + "/subsystem_vendor' 2>/dev/null); sd=$(cat '" + g + "/subsystem_device' 2>/dev/null); " +
+    "[ -n \"$v\" ] && [ -n \"$d\" ] || exit 0; " +
+    "[ -r /usr/share/hwdata/pci.ids ] || exit 0; " +
+    "awk -v v=\"${v#0x}\" -v d=\"${d#0x}\" -v sv=\"${sv#0x}\" -v sd=\"${sd#0x}\" '" +
+    "/^[0-9a-f]/ { invend = ($1 == v); indev = 0; next } " +
+    "invend && /^\\t[0-9a-f]/ { sub(/^\\t/, \"\"); " +
+    "if ($1 == d) { indev = 1; dname = substr($0, index($0, $2)) } else indev = 0; next } " +
+    "indev && /^\\t\\t/ { sub(/^\\t\\t/, \"\"); " +
+    "if ($1 == sv && $2 == sd) sname = substr($0, index($0, $3)); next } " +
+    "END { print (sname != \"\" ? sname : dname) }' /usr/share/hwdata/pci.ids"
+}
+
+// pci.ids device names read "<silicon> [<marketing name>]", e.g.
+// "Navi 21 [Radeon RX 6900 XT]" or "GA102 [GeForce RTX 3090]". The bracketed
+// half is the name a person recognises and the one worth showing. Entries
+// without brackets (many integrated parts) are already the plain name and
+// pass through unchanged.
+function parseGpuModel(raw) {
+  var s = String(raw || "").trim()
+  if (!s) return ""
+  var m = s.match(/\[([^\]]+)\]/)
+  return (m ? m[1] : s).trim()
+}
+
 // Full AMD GPU readout. Emits key=value lines so adding a field later does not
 // disturb the positional meaning of the others.
 function collectGpuDetail(gpuPath) {
@@ -1051,6 +1122,10 @@ if (typeof module !== "undefined" && module.exports) {
     mergeProcRows: mergeProcRows,
     cpuSortValue: cpuSortValue,
     collectGpuDetail: collectGpuDetail,
+    collectGpuModel: collectGpuModel,
+    parseGpuModel: parseGpuModel,
+    COLLECT_THEME_PALETTE: COLLECT_THEME_PALETTE,
+    parseThemePalette: parseThemePalette,
     collectProcDetail: collectProcDetail,
     parseGpuDetail: parseGpuDetail,
     parseProcDetail: parseProcDetail,
