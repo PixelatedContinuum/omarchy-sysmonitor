@@ -35,6 +35,25 @@ Panel {
     return isFinite(v) && v >= 500 ? v : 2000
   }
 
+  // The dropdown was rendering at the shell's raw font tokens while the full
+  // panel multiplied the same tokens by its own fontScale, so the two views
+  // disagreed by about a quarter and the dropdown read noticeably small. It
+  // now takes the same treatment and the same 1.25 default, which is what
+  // makes them look like one plugin at two sizes rather than two plugins.
+  readonly property real fontScale: {
+    var v = Number(setting("fontScale", 1.25))
+    return isFinite(v) && v > 0 ? v : 1.25
+  }
+  function fs(token) { return Math.round(token * root.fontScale) }
+
+  // Widened to match: larger text in a box sized for the smaller text would
+  // just wrap more. Scales with the same factor rather than being a second
+  // number to keep in step by hand.
+  readonly property int dropdownWidth: {
+    var v = Number(setting("dropdownWidth", Math.round(280 * root.fontScale)))
+    return isFinite(v) && v >= 200 ? v : Math.round(280 * root.fontScale)
+  }
+
   // ---- CPU (same delta approach as the full panel's cpuProc) ----
   property var cpuStatPrev: null
   property bool cpuPrimed: false
@@ -128,6 +147,7 @@ Panel {
     switch (name) {
       case "gpuDetectProc": return gpuDetectProc
       case "ifaceDetectProc": return ifaceDetectProc
+      case "themeProc": return themeProc
       case "cpuProc": return cpuProc
       case "memProc": return memProc
       case "diskProc": return diskProc
@@ -379,7 +399,7 @@ Panel {
     open: root.opened
     centerOnBar: false
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(280))
+    contentWidth: popup.fittedContentWidth(Style.space(root.dropdownWidth))
     contentHeight: popup.fittedContentHeight(card.implicitHeight)
 
     PanelKeyCatcher {
@@ -465,7 +485,7 @@ Panel {
           text: "Open full monitor →"
           color: openLinkHover.hovered ? Color.foreground : Color.accent
           font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
+          font.pixelSize: root.fs(Style.font.bodySmall)
           Behavior on color { ColorAnimation { duration: 120 } }
 
           HoverHandler { id: openLinkHover }
@@ -508,13 +528,13 @@ Panel {
       text: stat.label
       color: stat.accent
       font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      font.pixelSize: root.fs(Style.font.caption)
     }
     Text {
       text: stat.valueText
       color: stat.hot ? Color.urgent : Color.foreground
       font.family: Style.font.family
-      font.pixelSize: Style.font.body
+      font.pixelSize: root.fs(Style.font.body)
       Behavior on color { ColorAnimation { duration: 200 } }
     }
     MeterBar {
@@ -574,7 +594,7 @@ Panel {
       text: psec.title
       color: Color.muted
       font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      font.pixelSize: root.fs(Style.font.caption)
     }
 
     Repeater {
@@ -621,13 +641,13 @@ Panel {
         color: Color.foreground
         elide: Text.ElideRight
         font.family: Style.font.family
-        font.pixelSize: Style.font.bodySmall
+        font.pixelSize: root.fs(Style.font.bodySmall)
       }
       Text {
         text: pr.valueText
         color: Color.muted
         font.family: Style.font.family
-        font.pixelSize: Style.font.bodySmall
+        font.pixelSize: root.fs(Style.font.bodySmall)
       }
     }
   }

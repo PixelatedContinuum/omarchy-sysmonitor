@@ -27,7 +27,9 @@
     "category": "System",
     "allowMultiple": false,
     "defaults": {
-      "pollInterval": 2000
+      "pollInterval": 2000,
+      "fontScale": 1.25,
+      "dropdownWidth": 350
     }
   }
 }
