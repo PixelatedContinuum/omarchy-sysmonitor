@@ -169,10 +169,44 @@ Panel {
     if (primaryIface !== "") start(netProc, "netProc")
   }
 
+  // The same per-section colours the full panel uses, read from the active
+  // theme's own colors.toml, so the dropdown and the panel are recognisably
+  // one plugin rather than two things that happen to show similar numbers.
+  // See Model.COLLECT_THEME_PALETTE for why that file is read directly
+  // rather than taken from the Color singleton, which keeps only four of its
+  // values.
+  //
+  // Every reader goes through themeColor() and names its own fallback, so
+  // this renders correctly both in the moment before the file has loaded and
+  // on a theme that omits a key.
+  property var themePalette: ({})
+  function themeColor(key, fallback) {
+    var v = themePalette[key]
+    return v ? v : fallback
+  }
+  readonly property color secCpu: themeColor("blue", Color.accent)
+  readonly property color secMem: themeColor("green", Color.accent)
+  readonly property color secGpu: themeColor("magenta", Color.accent)
+  readonly property color secDisk: themeColor("cyan", Color.accent)
+  readonly property color secNet: themeColor("orange", Color.accent)
+  readonly property color secThermal: themeColor("brown", Color.accent)
+
   Component.onCompleted: {
     start(gpuDetectProc, "gpuDetectProc")
     start(ifaceDetectProc, "ifaceDetectProc")
+    start(themeProc, "themeProc")
     pollAll()
+  }
+
+  // Static: a theme change restarts the shell, so one read at startup is
+  // enough and this never joins the poll cycle.
+  Process {
+    id: themeProc
+    command: Model.wrapCollectorCommand(Model.COLLECT_THEME_PALETTE, Model.OUTPUT_CAP_MEDIUM)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.themePalette = Model.parseThemePalette(text)
+    }
   }
 
   Timer {
@@ -368,33 +402,40 @@ Panel {
           QuickStat {
             label: "CPU"; fraction: root.animCpu / 100; hot: root.cpuTotalPercent >= 90
             valueText: root.cpuPrimed ? Math.round(root.animCpu) + "%" : "…"
+            accent: root.secCpu
           }
           QuickStat {
             visible: root.gpuPath !== ""
             label: "GPU"; fraction: root.animGpu / 100; hot: root.gpuUtil >= 90
             valueText: Math.round(root.animGpu) + "%"
+            accent: root.secGpu
           }
           QuickStat {
             label: "MEM"; fraction: root.animMem / 100; hot: root.memPercent >= 90
             valueText: root.memInfo ? Math.round(root.animMem) + "%" : "…"
+            accent: root.secMem
           }
           QuickStat {
             label: "DISK"; fraction: root.animDisk / 100; hot: root.diskPercent >= 90
             valueText: Math.round(root.animDisk) + "%"
+            accent: root.secDisk
           }
           // No natural 0-1 scale for temperature or an open-ended network
           // rate, so these two skip the meter bar rather than force one onto
           // an arbitrary cap that would quietly mislead — the animated
           // number still carries the "this is live" motion on its own.
           QuickStat {
+            // The CPU package, matching the full panel's own TEMP figure.
             label: "TEMP"; hot: root.cpuTempC >= 85
             valueText: root.cpuTempC > 0 ? Math.round(root.animTemp) + "°C" : "…"
+            accent: root.secThermal
           }
           QuickStat {
             label: "NET"
             valueText: root.netRates
               ? "↑" + root._compactRate(root.netRates.txRate) + " ↓" + root._compactRate(root.netRates.rxRate)
               : "…"
+            accent: root.secNet
           }
         }
 
@@ -454,12 +495,18 @@ Panel {
     property string valueText: ""
     property real fraction: -1
     property bool hot: false
+    // The stat's own colour, carried by its label and its meter fill. Six
+    // identically-accented blocks read as one undifferentiated grid; giving
+    // each the hue its section has in the full panel is what tells them
+    // apart at a glance and ties the two views together. Defaults to the
+    // theme accent so a stat that names no colour renders as it always did.
+    property color accent: Color.accent
     spacing: Style.space(2)
     Layout.fillWidth: true
 
     Text {
       text: stat.label
-      color: Color.muted
+      color: stat.accent
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
     }
@@ -475,6 +522,7 @@ Panel {
       visible: stat.fraction >= 0
       value: stat.fraction
       warn: stat.hot
+      accent: stat.accent
     }
   }
 
@@ -488,6 +536,7 @@ Panel {
     id: mb
     property real value: 0
     property bool warn: false
+    property color accent: Color.accent
     implicitHeight: Style.space(5)
     height: implicitHeight
 
@@ -502,7 +551,7 @@ Panel {
         anchors.bottom: parent.bottom
         width: parent.width * Math.max(0, Math.min(1, mb.value))
         radius: parent.radius
-        color: mb.warn ? Color.urgent : Color.accent
+        color: mb.warn ? Color.urgent : mb.accent
         Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutQuad } }
       }
     }
