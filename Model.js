@@ -832,18 +832,24 @@ function buildGrantCapabilityScript(path, capString, backupPath) {
     // fails with "Failed to set capabilities on file '--': No such file or
     // directory" and getcap on the real target afterward shows no change,
     // while the identical command with `--` simply omitted succeeds and
-    // getcap confirms it. This has been in every setcap invocation in this
-    // file since the plugin's first commit; every prior test and every
-    // adversarial pass ran unprivileged, where setcap fails at the
-    // permission check before argument parsing is ever reached, so no
-    // prior run could have told this apart from an ordinary unprivileged
-    // failure. Dropping `--` is safe, not just necessary: setcap's
-    // filename slot is positional regardless of its own content (verified
-    // separately against a real target file named with a leading hyphen),
-    // and the caps/flag slot immediately before it is either a fixed
-    // string literal at each call site (capString here) or already
-    // guarded against a leading hyphen (buildRevokeCapabilityScript's
-    // "$old", see its own case statement).
+    // getcap confirms it. This plugin's own first eleven commits invoked
+    // setcap correctly, as a direct argv array with no `--` at all; a
+    // fifth adversarial pass found, via `git log -S` against this repo's
+    // own history, that `--` was introduced by the hardening commit that
+    // first answered a maintainer's review of this plugin, not present
+    // from the start as an earlier version of this comment claimed. It
+    // then survived four more adversarial rounds of review, because every
+    // one of them, and every prior test, ran unprivileged, where setcap
+    // fails at the permission check before argument parsing is ever
+    // reached, so no prior run could have told this apart from an
+    // ordinary unprivileged failure. Dropping `--` is safe, not just
+    // necessary: setcap's filename slot is positional regardless of its
+    // own content (verified separately against a real target file named
+    // with a leading hyphen), and the caps/flag slot immediately before it
+    // is either a fixed string literal at each call site (capString here)
+    // or, on the revoke side, a value that cannot begin with a hyphen at
+    // all once it has matched buildRevokeCapabilityScript's own capRe
+    // (see its own comment).
     "setcap " + sq(String(capString || "")) + " \"$real\""
 }
 
@@ -866,6 +872,32 @@ function buildGrantCapabilityScript(path, capString, backupPath) {
 function buildRevokeCapabilityScript(path, backupPath) {
   var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
   var bp = sq(String(backupPath || ""))
+  // Structural validator for $old, not a charset. A charset only asks
+  // whether a string is built from safe characters; it cannot ask which
+  // capabilities it names. A fifth adversarial pass found that this
+  // function's own prior charset guard accepted "all=eip" (the reserved
+  // cap_from_text(3) keyword, built entirely from ordinary letters) and,
+  // verified end to end against this plugin's own generated scripts under
+  // real privilege, root's setcap then granted the complete capability
+  // set to a world-executable binary through a button whose only
+  // advertised purpose is to reduce a privilege. This grammar instead
+  // requires one or more whitespace-separated clauses, each a
+  // comma-separated list of names shaped like a real capability name
+  // (cap_ followed by lowercase letters and underscores, the only shape
+  // getcap's own output ever takes, verified directly, never the bare
+  // "all" keyword), followed by =/+/- and zero or more of the three
+  // lowercase flag characters. A bare "=" is also accepted: it is getcap's
+  // own rendering of an explicitly-empty capability set, confirmed
+  // directly, distinct from no attribute at all. This still authorizes
+  // restoring any real, specific prior capability this account never
+  // chose, which is the backup mechanism's actual purpose; it excludes
+  // only the one keyword that expands to every capability in existence,
+  // which getcap itself never emits as output and no legitimate backup
+  // content could ever need. setcap's own parser remains the final,
+  // stricter gate underneath this, the same division of labor visudo -cf
+  // has elsewhere in this codebase.
+  var clause = "cap_[a-z_]+(,cap_[a-z_]+)*[=+-][eip]*"
+  var capRe = "^(=|" + clause + ")( " + clause + ")*$"
   return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
     "[ -n \"$real\" ] || exit 20; " +
     // `-f` alone is not enough: it follows a symlink to check whether ITS
@@ -877,58 +909,25 @@ function buildRevokeCapabilityScript(path, backupPath) {
     "[ -f " + bp + " ] && [ ! -L " + bp + " ] || exit 23; " +
     "old=$(cat " + bp + " 2>/dev/null || true); " +
     // The symlink guard above protects the PATH; this protects the
-    // CONTENT. backupPath lives in a location this account can write to
-    // by design, so nothing stops it (or anything running as it) from
-    // overwriting the file directly with some other syntactically-shaped
-    // capability string, which an unguarded restore would hand straight
-    // to root's setcap. Real getcap output across this system (surveyed
-    // directly, not assumed: newgidmap, newuidmap, btop, rcp/rlogin/rsh,
-    // gsr-kms-server, bandwhich) is consistently "cap_name[,cap_name...]
-    // =flags" with no `+`/`-` and no spaces, but that survey describes what
-    // happens to be granted on this one system, not the full format setcap
-    // and getcap actually accept. cap_text_formats(7), the authoritative
-    // spec, allows one or more whitespace-separated clauses, each using
-    // `=`, `+`, or `-` as its operator, and an adversarial pass caught that
-    // the original charset was narrower than that real spec: a legitimate
-    // multi-clause backup, or one using `+`/`-`, would have been refused
-    // rather than restored, indistinguishable from an actual injection
-    // attempt. The charset below now allows the full documented range,
-    // letters, digits, underscore, comma, the three operators, and the
-    // whitespace that separates clauses, verified against both real
-    // capability strings and a battery of injection attempts before this
-    // was written. It remains a shape filter, not a full parser: setcap's
-    // own parser, already proven strict (it rejects getcap's combined
-    // "path capspec" form outright), is what decides whether the surviving
-    // string is actually well-formed, the same division of labor
-    // visudo -cf has elsewhere in this codebase.
+    // CONTENT, and this is the part that mattered most: backupPath lives
+    // in a location this account can write to by design, so nothing stops
+    // it (or anything running as it) from overwriting the file directly
+    // with some other syntactically-shaped capability string, which an
+    // unguarded restore would hand straight to root's setcap. See capRe
+    // above for what actually happened here across two prior rounds of
+    // review before this fix, and why the check is a grammar now, not a
+    // charset.
     //
     // rc is captured explicitly in every branch, including the empty-backup
     // one, rather than assumed or left to whatever the trailing cleanup
     // command returns: a failed setcap (wrong privilege, or a
-    // charset-passing string setcap's own parser still rejects) needs to be
-    // reported as the failure it is, not masked as success because cleanup
-    // ran last and cleanup usually succeeds. The cleanup itself now runs
-    // only on success: a failed restore, whichever branch it failed in,
-    // leaves the backup file in place rather than deleting the one record
-    // of what to restore, so a retry after the underlying problem is fixed
-    // still has something to restore from. Both found while testing the
-    // charset widening above, not assumed correct because the surrounding
-    // shape looked like the (correct) pattern already used in
-    // buildCollisionSafeInstallScript below.
-    //
-    // Widening the charset to allow `-` (needed for the legitimate
-    // "cap_foo-e" remove-flag clause) opened a separate gap, found by
-    // testing setcap's own argument handling directly rather than assumed
-    // safe because the charset change looked complete on its own: $old is
-    // setcap's first positional argument, so a backup holding exactly "-r"
-    // or "--help" is not a syntactically-invalid capability string that
-    // setcap cleanly rejects, it is setcap's own flag, and gets executed
-    // as one (confirmed directly: `setcap "-r" /usr/bin/bash` reached the
-    // exact same code path as an explicit `setcap -r`). No real capability
-    // clause ever begins with a hyphen, cap_text_formats(7) only allows
-    // `-` as a mid-clause flag operator, so refusing any value that starts
-    // with one closes this without narrowing what a real backup can
-    // contain.
+    // structurally-valid string setcap's own parser still rejects) needs
+    // to be reported as the failure it is, not masked as success because
+    // cleanup ran last and cleanup usually succeeds. The cleanup itself
+    // runs only on success: a failed restore, whichever branch it failed
+    // in, leaves the backup file in place rather than deleting the one
+    // record of what to restore, so a retry after the underlying problem
+    // is fixed still has something to restore from.
     //
     // Neither setcap call below has a `--` in front of "$real" (an earlier
     // version of both this comment and the code had one, on the mistaken
@@ -936,6 +935,18 @@ function buildRevokeCapabilityScript(path, backupPath) {
     // command): see buildGrantCapabilityScript's setcap line for why that
     // assumption is wrong for setcap specifically, and why $real does not
     // need that protection anyway.
+    //
+    // [[ =~ ]] is used for the non-empty branch rather than a case/glob
+    // pattern, what every other guard in this file uses: POSIX glob
+    // patterns have no way to express alternation or the repeated
+    // "clause, clause, clause" structure capRe needs. The pattern is
+    // passed unquoted after =~, required for bash to treat it as a regular
+    // expression rather than a literal string match, verified directly.
+    // capRe already requires the string to start with "cap_" or a bare
+    // "=", so nothing starting with a hyphen (setcap's own flags all
+    // begin with one, confirmed directly against setcap's exact-strcmp
+    // flag handling) can reach the catch-all branch at all; no separate
+    // leading-hyphen guard is needed on top of it.
     //
     // The empty-backup branch's rc=$? is the literal exit status of
     // `setcap -r`, which is not quite the same question as "did the
@@ -954,16 +965,10 @@ function buildRevokeCapabilityScript(path, backupPath) {
     // and rc is corrected to 0. If getcap still shows a capability, the
     // failure was real (wrong privilege, read-only filesystem, an
     // immutable bit) and rc is left exactly as setcap reported it.
-    // Verified across all three shapes before writing this: already
-    // clear, genuinely has a capability (setcap -r succeeds directly, this
-    // check never even triggers), and a real failure with the capability
-    // still present (rc correctly stays nonzero, not masked).
     "case \"$old\" in " +
     "  '') setcap -r \"$real\" 2>/dev/null; rc=$?; " +
     "      if [ \"$rc\" -ne 0 ] && [ -z \"$(getcap -- \"$real\" 2>/dev/null)\" ]; then rc=0; fi ;; " +
-    "  -*) rc=26 ;; " +
-    "  *[!A-Za-z0-9_,=+\\ -]*) rc=26 ;; " +
-    "  *) setcap \"$old\" \"$real\"; rc=$? ;; " +
+    "  *) if [[ \"$old\" =~ " + capRe + " ]]; then setcap \"$old\" \"$real\"; rc=$?; else rc=26; fi ;; " +
     "esac; " +
     "[ \"$rc\" -eq 0 ] && rm -f " + bp + "; " +
     "exit $rc"
@@ -1002,7 +1007,29 @@ function buildCollisionSafeInstallScript(targetPath, content, mode, owner, group
   // already replaces a symlink destination rather than following it
   // (verified directly, the same way `mv` does), so no equivalent guard
   // is needed there.
-  return "t=$(mktemp) && printf '%s' " + sq(String(content || "")) + " > \"$t\" && chmod " + m + " \"$t\" && " +
+  //
+  // The ancestor walk below is the same reasoning, extended to match: a
+  // fifth adversarial pass found that a comment describing this
+  // function's guard alongside buildGrantCapabilityScript's own ancestor
+  // walk claimed both covered "any ancestor", when this one covered only
+  // the destination itself. Demonstrated (against a caller other than
+  // this plugin's own two, since neither of those two is reachable here):
+  // a symlinked parent directory is followed, and the file lands outside
+  // it, exit 0. Still not reachable through this plugin's own two callers
+  // today, for the same reason the leaf check already was defense in
+  // depth rather than a response to a live path, but the guard now
+  // actually matches what it was already believed to do, for any future
+  // caller as much as this one.
+  var targetDir = String(targetPath || "").replace(/\/[^/]*$/, "")
+  var dirParts = targetDir.split("/").filter(function(p) { return p !== "" })
+  var ancestorGuard = ""
+  var prefix = ""
+  for (var i = 0; i < dirParts.length; i++) {
+    prefix += "/" + dirParts[i]
+    ancestorGuard += "[ ! -L " + sq(prefix) + " ] || exit 1; "
+  }
+  return ancestorGuard +
+    "t=$(mktemp) && printf '%s' " + sq(String(content || "")) + " > \"$t\" && chmod " + m + " \"$t\" && " +
     validate +
     "[ ! -L " + tp + " ] && " +
     "{ [ -e " + tp + " ] && ! cmp -s \"$t\" " + tp + " && bak=$(mktemp " + tp + ".bak-XXXXXX 2>/dev/null) && cp -p " + tp + " \"$bak\" 2>/dev/null; true; } && " +

@@ -743,10 +743,21 @@ Item {
         root.smartAvailable = t.indexOf("smartctl-ok") >= 0 || root.smartNeedsSudo
         if (root.smartAvailable) root.start(nvmeListProc, "nvmeListProc")
         // Also the point where a just-finished grant's busy state clears,
-        // not grantProc.onExited itself — see the comment there. Runs on
-        // every probe, including the plain panel-open one, where grantBusy
-        // is already "" and this is a no-op.
-        root.grantBusy = ""
+        // not grantProc.onExited itself — see the comment there. Guarded
+        // on grantProc no longer running, not unconditional: a fifth
+        // adversarial pass found this probe also runs on ordinary
+        // panel-open (start(probeProc) at onLiveChanged), and an
+        // unconditional clear here meant pressing Enable, dismissing the
+        // polkit prompt with Esc, and reopening the panel before the
+        // privileged script itself had exited cleared grantBusy while
+        // that script was still running, narrowing round 4's
+        // double-grant window rather than closing it. grantProc.running
+        // is already false by the time THIS probe's own post-grant
+        // invocation reaches here, since onExited already ran before
+        // start(probeProc) was called, so the ordinary post-grant path is
+        // unaffected; only the unrelated in-flight-grant case is now
+        // correctly left alone.
+        if (!grantProc.running) root.grantBusy = ""
       }
     }
   }

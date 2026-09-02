@@ -494,6 +494,44 @@ check("two same-second collisions each keep their own backup, neither clobbers t
         try { fs.unlinkSync(t) } catch (e) {}
         return backups.length === 2 && contents[0] === "gen-0" && contents[1] === "gen-1"
       })())
+check("live: refuses (does not follow) when the target's PARENT directory is a symlink, not just when the target itself is one",
+      (function() {
+        // Regression for a fifth-pass finding: this function's own -L
+        // check covers only the destination, not any ancestor of it,
+        // unlike buildGrantCapabilityScript's walk. A symlinked parent
+        // used to be followed silently, landing the install outside the
+        // intended directory entirely.
+        var pid = process.pid
+        var base = "/tmp/sysmonitor-test-csi-ancestor-" + pid
+        var elsewhere = base + "-elsewhere"
+        var parentLink = base + "/parentdir"
+        try { fs.rmSync(base, { recursive: true, force: true }) } catch (e) {}
+        try { fs.rmSync(elsewhere, { recursive: true, force: true }) } catch (e) {}
+        fs.mkdirSync(elsewhere, { recursive: true })
+        fs.mkdirSync(base, { recursive: true })
+        fs.symlinkSync(elsewhere, parentLink)
+        var built = M.buildCollisionSafeInstallScript(parentLink + "/target", "escaped content", "0644", "", "", null)
+        var threw = false
+        try { cp.execSync(built, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { threw = true }
+        var escaped = fs.existsSync(elsewhere + "/target")
+        fs.rmSync(base, { recursive: true, force: true })
+        fs.rmSync(elsewhere, { recursive: true, force: true })
+        return threw && !escaped
+      })())
+check("live: refuses (does not follow) when the target itself is a symlink",
+      (function() {
+        var victim = "/tmp/sysmonitor-test-csi-leaf-victim-" + process.pid
+        var link = "/tmp/sysmonitor-test-csi-leaf-link-" + process.pid
+        fs.writeFileSync(victim, "VICTIM")
+        try { fs.unlinkSync(link) } catch (e) {}
+        fs.symlinkSync(victim, link)
+        var built = M.buildCollisionSafeInstallScript(link, "new content", "0644", "", "", null)
+        var threw = false
+        try { cp.execSync(built, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { threw = true }
+        var untouched = fs.readFileSync(victim, "utf8") === "VICTIM"
+        fs.unlinkSync(victim); fs.unlinkSync(link)
+        return threw && untouched
+      })())
 csiBackups().forEach(function(f) { try { fs.unlinkSync("/tmp/" + f) } catch (e) {} })
 try { fs.unlinkSync(csiTarget) } catch (e) {}
 
@@ -877,19 +915,61 @@ check("live: the widened charset now accepts real multi-clause and +/- capabilit
         try { fs.unlinkSync(backupPath) } catch (e) {}
         return noneRefusedByCharset
       })())
-check("live: a charset-valid but grammatically malformed capability string passes the shape filter and is still rejected, just by setcap itself rather than at 26",
+check("live: revoke refuses (exit 26) the reserved \"all\" keyword in every shape that reaches root's setcap, a real privilege-escalation path a charset-only guard let through",
       (function() {
-        // "cap_net_raw eip" is letters, underscore, and a space, all in
-        // the allowed set, but missing the =/+/- operator a real clause
-        // requires. buildRevokeCapabilityScript is deliberately a shape
-        // filter, not a full parser (see its own comment), so this should
-        // reach setcap rather than being refused at 26, and setcap's own
-        // stricter parser is what actually catches it.
+        // Regression test for the most severe defect found across every
+        // round of review: "all" is a cap_from_text(3) reserved keyword
+        // built entirely from ordinary letters, so the charset-only guard
+        // this function used to have accepted "all=eip" and root's setcap
+        // granted the complete capability set, verified end to end under
+        // real privilege, through a button whose only advertised purpose
+        // is to reduce a privilege. capRe requires every name to start
+        // with "cap_", which "all" (in any case) never does, so none of
+        // these should ever reach setcap.
+        var backupPath = "/tmp/sysmonitor-test-all-keyword-" + process.pid + ".bak"
+        var attempts = ["all=eip", "all+eip", "all-e", "ALL=eip", "All=eip", "cap_net_raw=ep all+eip"]
+        var allRefused = attempts.every(function(bad) {
+          fs.writeFileSync(backupPath, bad)
+          var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+          return r.status === 26
+        })
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return allRefused
+      })())
+check("live: revoke refuses (exit 26) a charset-valid but grammatically malformed capability string, now at the grammar stage rather than reaching setcap",
+      (function() {
+        // "cap_net_raw eip" is letters, underscore, and a space, which
+        // would have passed the old character-only charset guard, but is
+        // missing the =/+/- operator a real clause requires. capRe now
+        // parses structure, not just characters, so this is refused
+        // before setcap ever sees it, not after.
         var backupPath = "/tmp/sysmonitor-test-shape-ok-grammar-bad-" + process.pid + ".bak"
         fs.writeFileSync(backupPath, "cap_net_raw eip")
         var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
         try { fs.unlinkSync(backupPath) } catch (e) {}
-        return r.status !== 26 && !r.ok
+        return r.status === 26
+      })())
+check("live: revoke accepts a bare \"=\", getcap's own rendering of an explicitly-empty capability set",
+      (function() {
+        var backupPath = "/tmp/sysmonitor-test-bare-equals-" + process.pid + ".bak"
+        fs.writeFileSync(backupPath, "=")
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return r.status !== 26
+      })())
+check("live: revoke still accepts a real, specific, individually-named capability set the account never chose, including one that is itself dangerous, since the backup mechanism's job is restoring an arbitrary prior state, not judging it",
+      (function() {
+        // The grammar deliberately does not try to guess which SPECIFIC
+        // capabilities are "safe" to restore, only that "all" itself is
+        // excluded: a real backup could legitimately hold almost anything
+        // a system administrator set outside this plugin, and refusing to
+        // restore a real, well-formed, individually-named set would defeat
+        // the backup's actual purpose.
+        var backupPath = "/tmp/sysmonitor-test-real-dangerous-cap-" + process.pid + ".bak"
+        fs.writeFileSync(backupPath, "cap_setuid,cap_setgid=eip")
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return r.status !== 26
       })())
 check("live: a real capability string in the shape getcap actually emits passes the charset guard (setcap itself is the next and final gate)",
       (function() {
@@ -921,6 +1001,79 @@ check("never throws on garbage input", (function() {
   M.buildRevokeCapabilityScript(undefined, undefined)
   return true
 })())
+if (!canUnshareSetcap) {
+  skipped("live: the real generated grant/revoke scripts actually change a capability under genuine privilege", "unshare -Ur + setcap unavailable in this environment (unprivileged user namespaces likely restricted)")
+} else {
+  check("live: the real generated grant/revoke scripts actually change a capability under genuine privilege, not just exit 0",
+        (function() {
+          // Regression guard for a bug that hid from every earlier round
+          // of review and from this whole suite: a `--` placed before the
+          // target path in three setcap invocations (one in
+          // buildGrantCapabilityScript, two in buildRevokeCapabilityScript)
+          // made setcap treat `--` itself as the filename and silently
+          // leave the real target untouched, because setcap has no
+          // getopt-style option terminator. Every other check in this
+          // file runs unprivileged, where setcap fails at its own
+          // permission check before argument parsing is ever reached, so
+          // reintroducing that exact bug at all three call sites was
+          // confirmed, while fixing this, to still leave the entire
+          // unprivileged suite green. Only running the real generated
+          // scripts under genuine privilege and checking the actual
+          // capability via getcap, not just the script's own exit code,
+          // can catch this class of bug, which is what this check does.
+          //
+          // The grant script's own trusted-directory guard requires a
+          // path under /usr/bin, /usr/sbin, /usr/local/bin or
+          // /usr/local/sbin, none of which this suite may safely write
+          // to, so only the setcap invocation itself, the part the bug
+          // was actually in, is extracted and run with $real substituted
+          // for a scratch target; the guard itself is already covered by
+          // "the grant script's own path guard rejects a target outside
+          // trusted directories" above. The revoke script has no such
+          // guard (see the live symlink checks above), so it runs
+          // unmodified, in full, exactly as pkexec would invoke it.
+          var target = "/tmp/sysmonitor-test-real-privilege-" + process.pid
+          fs.writeFileSync(target, fs.readFileSync("/bin/true"))
+          fs.chmodSync(target, 0o755)
+          var backupPath = target + ".bak"
+          try { fs.unlinkSync(backupPath) } catch (e) {}
+
+          var realGetcap = function() {
+            try { return cp.execFileSync("unshare", ["-Ur", "getcap", "--", target], { encoding: "utf8" }) }
+            catch (e) { return "" }
+          }
+          var runPrivileged = function(script) {
+            try { return { ok: true, out: cp.execFileSync("unshare", ["-Ur", "bash", "-c", script], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) } }
+            catch (e) { return { ok: false, status: e.status } }
+          }
+
+          // Grant: extract from the last "setcap " onward, matching
+          // buildGrantCapabilityScript's own final line exactly, and
+          // supply $real directly rather than re-deriving the guard chain.
+          var fullGrant = M.buildGrantCapabilityScript(target, "cap_net_raw,cap_net_admin+eip", backupPath)
+          var setcapIdx = fullGrant.lastIndexOf("setcap ")
+          var grantTail = "real='" + target + "'; " + fullGrant.substring(setcapIdx)
+          var g = runPrivileged(grantTail)
+          var afterGrant = realGetcap()
+          var grantWorked = g.ok && afterGrant.indexOf("cap_net_raw") >= 0 && afterGrant.indexOf("cap_net_admin") >= 0
+
+          // Revoke, non-empty (real) backup: the full, unmodified script.
+          fs.writeFileSync(backupPath, "cap_net_raw=ep")
+          var r1 = runPrivileged(M.buildRevokeCapabilityScript(target, backupPath))
+          var afterRevoke1 = realGetcap()
+          var revokeRestoredWorked = r1.ok && afterRevoke1.indexOf("cap_net_raw=ep") >= 0 && afterRevoke1.indexOf("cap_net_admin") < 0
+
+          // Revoke, empty backup (the setcap -r branch): full script again.
+          fs.writeFileSync(backupPath, "")
+          var r2 = runPrivileged(M.buildRevokeCapabilityScript(target, backupPath))
+          var afterRevoke2 = realGetcap()
+          var revokeStripWorked = r2.ok && afterRevoke2.trim() === ""
+
+          try { fs.unlinkSync(target) } catch (e) {}
+          try { fs.unlinkSync(backupPath) } catch (e) {}
+          return grantWorked && revokeRestoredWorked && revokeStripWorked
+        })())
+}
 
 section("bandwhich — real raw format")
 var bwCaps = sh('getcap "$(command -v bandwhich)" 2>/dev/null') || ""
