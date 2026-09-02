@@ -73,8 +73,6 @@ Item {
 
   readonly property int pollInterval: setting("pollInterval", 2000)
   readonly property bool showCpuPerCore: setting("showCpuPerCore", true)
-  readonly property bool showSmartHealth: setting("showSmartHealth", true)
-  readonly property bool showBandwhich: setting("showBandwhich", true)
   readonly property int processCount: setting("processCount", 14)
   readonly property bool showAllSensors: setting("showAllSensors", false)
   // Multiplier over the theme's font tokens. This is a dense readout meant to
@@ -121,20 +119,14 @@ Item {
   property var netPrev: null
   property real netPrevAt: 0
   property var netRates: ({})
-  property var bandwhichRows: []
-  property var bandwhichAccum: null
   property string primaryIface: ""
 
   property var diskData: []
-  property var smartData: null
 
   property string gpuPath: ""
   property int gpuUtil: 0
   property real gpuTemp: 0
   property var gpuInfo: null           // full readout — VRAM, power, clocks, temps
-  property var nvmeDevices: []
-  property var smartList: []           // one entry per NVMe drive
-  property bool smartNeedsSudo: false
   property var procDetail: null        // exe / cwd / ancestry for selectedProcess
   property int detailTick: 0           // seconds since the detail view opened
 
@@ -177,11 +169,6 @@ Item {
     s = s.replace(/^\d+th Gen\s+/i, "")
     return s.replace(/\s+/g, " ").trim()
   }
-
-  // Both tools sit on PATH but neither works unprivileged here, so presence
-  // is not the test — the probe runs the real command.
-  property bool bandwhichAvailable: false
-  property bool smartAvailable: false
 
   // ─────────────────────────────────────────────── responsive breakpoints
   //
@@ -226,6 +213,21 @@ Item {
       if (sensorData[i].name === "coretemp" || sensorData[i].name === "k10temp"
           || sensorData[i].name === "zenpower") return sensorData[i].tempC
     return 0
+  }
+
+  // Drive temperature, the one piece of drive health available without any
+  // privileges: the NVMe driver publishes each controller's Composite
+  // reading through hwmon, the same world-readable interface every other
+  // temperature on this panel already comes from. The rest of SMART (wear
+  // level, error counts, power-on hours) needs a root-only device ioctl and
+  // is deliberately not shown rather than asking for a privilege to get it.
+  // filterSensors has already reduced each drive to its Composite reading
+  // and numbered them, so these arrive display-ready.
+  readonly property var driveTemps: {
+    var out = []
+    for (var i = 0; i < sensorData.length; i++)
+      if (sensorData[i].name === "nvme") out.push(sensorData[i])
+    return out
   }
 
   // The single most useful temperature to surface at a glance: whatever is
@@ -414,100 +416,6 @@ Item {
                              "lsof -p " + p])
   }
 
-  property string grantBusy: ""
-  property string grantError: ""
-  // "grant" or "revoke" — which action grantProc is currently mid-flight
-  // for, so its one shared onExited handler can word a generic failure
-  // correctly instead of always saying "grant failed" on what might be a
-  // revoke.
-  property string grantAction: ""
-
-  // Per-user state, not plugin config: where a capability backup lives so
-  // revokeBandwhich can restore exactly what was there before this plugin
-  // touched it, rather than guessing "probably nothing". Deliberately
-  // outside the plugin's own (git-tracked) install directory.
-  readonly property string grantStateDir: (Quickshell.env("HOME") || "") + "/.local/state/jharrison-sysmonitor"
-  readonly property string bandwhichCapBackupPath: grantStateDir + "/bandwhich-cap.bak"
-
-  // Privilege grants run through pkexec, so the polkit agent raises its own
-  // password dialog and this panel never sees the credential. Nothing is
-  // granted silently — each is a distinct button the user presses.
-  //
-  // bandwhich needs packet-capture capability on the binary. smartctl needs to
-  // open a root-owned block device; a narrow sudoers entry allows exactly the
-  // SMART read without putting the account in the `disk` group, which would
-  // grant raw read/write to every disk rather than one command.
-  //
-  // Both run through grantValidateProc FIRST, unprivileged — resolving the
-  // real path, confirming it is root-owned, a regular file, inside a
-  // trusted system directory, and (where pacman is available) tracked by an
-  // installed package — before ever prompting for a password. A grant that
-  // was going to fail this check would otherwise still ask for credentials
-  // to do something it was never going to do.
-  function grantBandwhich() {
-    grantBusy = "bandwhich"; grantError = ""; grantAction = "grant"
-    grantValidateProc.pendingTarget = "bandwhich"
-    grantValidateProc.command = ["bash", "-c", Model.buildExecutableValidationScript("/usr/bin/bandwhich")]
-    grantValidateProc.running = true
-  }
-
-  function grantSmart() {
-    grantBusy = "smartctl"; grantError = ""; grantAction = "grant"
-    // Checked here, synchronously and before even the unprivileged binary
-    // check below, not just inside buildGrantSmartScript: that check alone
-    // meant an unusual-but-legitimate account name only surfaced its
-    // refusal AFTER pkexec had already prompted for and accepted a
-    // password, directly contradicting this same point's "before any
-    // password prompt" requirement for a value that fails validation.
-    if (!Model.isValidUsername(Quickshell.env("USER") || "")) {
-      grantBusy = ""
-      grantError = "not granted: could not validate the account name; no sudoers rule was written"
-      return
-    }
-    grantValidateProc.pendingTarget = "smartctl"
-    grantValidateProc.command = ["bash", "-c", Model.buildExecutableValidationScript("/usr/bin/smartctl")]
-    grantValidateProc.running = true
-  }
-
-  // The privileged half of each grant, dispatched once grantValidateProc's
-  // onStreamFinished below confirms the target passed validation.
-  function proceedGrantBandwhich(realPath) {
-    grantAction = "grant"
-    grantProc.pendingLabel = "granting per-process network"
-    grantProc.command = ["pkexec", "bash", "-c", Model.buildGrantCapabilityScript(
-      realPath, "cap_net_raw,cap_net_admin+eip", root.bandwhichCapBackupPath)]
-    grantProc.running = true
-  }
-
-  function proceedGrantSmart(realPath) {
-    grantAction = "grant"
-    grantProc.pendingLabel = "granting drive health access"
-    grantProc.command = ["pkexec", "bash", "-c",
-      Model.buildGrantSmartScript(Quickshell.env("USER") || "", realPath)]
-    grantProc.running = true
-  }
-
-  // The in-panel undo — a way back to "not granted" without uninstalling
-  // the whole plugin, which `omarchy plugin remove` does not do on its own
-  // (see README → Uninstall). No re-validation before revoke: reducing a
-  // privilege is not the action Point 7 is about, and the scripts
-  // themselves re-resolve the real path fresh rather than trusting a
-  // stale one.
-  function revokeBandwhich() {
-    grantBusy = "bandwhich"; grantError = ""; grantAction = "revoke"
-    grantProc.pendingLabel = "revoking per-process network"
-    grantProc.command = ["pkexec", "bash", "-c",
-      Model.buildRevokeCapabilityScript("/usr/bin/bandwhich", root.bandwhichCapBackupPath)]
-    grantProc.running = true
-  }
-
-  function revokeSmart() {
-    grantBusy = "smartctl"; grantError = ""; grantAction = "revoke"
-    grantProc.pendingLabel = "revoking drive health access"
-    grantProc.command = ["pkexec", "bash", "-c", Model.buildRevokeSmartScript()]
-    grantProc.running = true
-  }
-
   function togglePause() {
     if (!processPaused) processFrozen = processData.slice()
     processPaused = !processPaused
@@ -613,7 +521,6 @@ Item {
   // start() above) needs this explicit lookup to act on one.
   function collectorByName(name) {
     switch (name) {
-      case "probeProc": return probeProc
       case "gpuDetectProc": return gpuDetectProc
       case "staticInfoProc": return staticInfoProc
       case "cpuProc": return cpuProc
@@ -622,9 +529,7 @@ Item {
       case "pressureProc": return pressureProc
       case "netProc": return netProc
       case "gpuProc": return gpuProc
-      case "nvmeListProc": return nvmeListProc
       case "diskProc": return diskProc
-      case "smartProc": return smartProc
       case "sensorProc": return sensorProc
       case "fanProc": return fanProc
       case "procProc": return procProc
@@ -650,7 +555,7 @@ Item {
       var proc = root.collectorByName(n)
       // wrapCollectorCommand made every collector its own process-group
       // leader (setsid) — killing the group, not just this one pid, is
-      // what stops a hung pipeline stage (awk, cat, smartctl…) from
+      // what stops a hung pipeline stage (awk, cat, ps…) from
       // surviving as an orphan after the leader is gone.
       if (proc) {
         var pid = proc.processId
@@ -682,7 +587,6 @@ Item {
     if (due(mainPeriod * 2, 7, force)) start(sensorProc, "sensorProc")
     if (due(mainPeriod * 2, 9, force)) start(fanProc, "fanProc")
     if (due(mainPeriod * 10, 11, force)) start(diskProc, "diskProc")
-    if (smartAvailable && showSmartHealth && due(mainPeriod * 20, 13, force)) start(smartProc, "smartProc")
   }
 
   Timer {
@@ -718,50 +622,15 @@ Item {
       cpuPrimed = false
       netPrev = null
       procTicksPrev = null
-      start(probeProc, "probeProc")
       start(gpuDetectProc, "gpuDetectProc")
       start(staticInfoProc, "staticInfoProc")
       runCollectors(true)
     } else {
-      bandwhichAccum = null
       collectorStarts = {}
     }
   }
 
   // ─────────────────────────────────────────────── collectors
-  Process {
-    id: probeProc
-    command: Model.wrapCollectorCommand(Model.collectToolProbe(), Model.OUTPUT_CAP_TINY)
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var t = String(text || "")
-        root.bandwhichAvailable = t.indexOf("bandwhich-ok") >= 0
-        // Two ways SMART can work: readable directly (user in the disk group,
-        // or a udev rule), or via a NOPASSWD sudoers entry. Neither is assumed.
-        root.smartNeedsSudo = t.indexOf("smartctl-sudo") >= 0
-        root.smartAvailable = t.indexOf("smartctl-ok") >= 0 || root.smartNeedsSudo
-        if (root.smartAvailable) root.start(nvmeListProc, "nvmeListProc")
-        // Also the point where a just-finished grant's busy state clears,
-        // not grantProc.onExited itself — see the comment there. Guarded
-        // on grantProc no longer running, not unconditional: a fifth
-        // adversarial pass found this probe also runs on ordinary
-        // panel-open (start(probeProc) at onLiveChanged), and an
-        // unconditional clear here meant pressing Enable, dismissing the
-        // polkit prompt with Esc, and reopening the panel before the
-        // privileged script itself had exited cleared grantBusy while
-        // that script was still running, narrowing round 4's
-        // double-grant window rather than closing it. grantProc.running
-        // is already false by the time THIS probe's own post-grant
-        // invocation reaches here, since onExited already ran before
-        // start(probeProc) was called, so the ordinary post-grant path is
-        // unaffected; only the unrelated in-flight-grant case is now
-        // correctly left alone.
-        if (!grantProc.running) root.grantBusy = ""
-      }
-    }
-  }
-
   Process {
     id: gpuDetectProc
     command: Model.wrapCollectorCommand(Model.COLLECT_GPU_PATH, Model.OUTPUT_CAP_TINY)
@@ -878,72 +747,12 @@ Item {
   }
 
   Process {
-    id: nvmeListProc
-    command: Model.wrapCollectorCommand(Model.COLLECT_NVME_LIST, Model.OUTPUT_CAP_TINY)
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var list = String(text || "").trim().split("\n").filter(function(d) { return d })
-        root.nvmeDevices = list
-        if (list.length > 0) root.start(smartProc, "smartProc")
-      }
-    }
-  }
-
-  Process {
     id: diskProc
     command: Model.wrapCollectorCommand(
       "df -h --output=source,size,used,avail,pcent,target", Model.OUTPUT_CAP_LARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: { root.diskData = Model.parseDfOutput(text); root.clampCursor() }
-    }
-  }
-
-  Process {
-    id: smartProc
-    // Elevated case: invoke the fixed root-owned helper bare, no arguments,
-    // no per-device loop, since it does its own /dev/nvme*n1 enumeration and
-    // already emits the same "@@$device" marker format parsed below, and
-    // the sudoers grant permits exactly this one command with an explicit
-    // empty-argument spec, nothing to pass it even if we wanted to.
-    // `sudo -n` never prompts: if the sudoers entry is missing it fails
-    // immediately and the row says so. Unprivileged case is unchanged: one
-    // direct smartctl invocation per drive, since there's no helper doing
-    // enumeration outside the elevated path.
-    command: Model.wrapCollectorCommand(root.smartNeedsSudo
-      ? "sudo -n " + Model.SMART_HELPER_PATH
-      : (function() {
-          // Model.isValidNvmeDevice gates entry into this string the same
-          // way Model.isValidIfaceName gates bandwhichProc's command, even
-          // though the source enumeration (COLLECT_NVME_LIST) is a fixed
-          // glob no ordinary user can steer: relying on an upstream source's
-          // assumed-safe shape is exactly the assumption review point 3
-          // warned against, and this was the one sibling collector that had
-          // not gotten it yet.
-          var parts = []
-          for (var i = 0; i < root.nvmeDevices.length; i++) {
-            if (!Model.isValidNvmeDevice(root.nvmeDevices[i])) continue
-            parts.push("echo '@@" + root.nvmeDevices[i] + "'; "
-                       + "smartctl -j -a '" + root.nvmeDevices[i] + "' 2>/dev/null")
-          }
-          return parts.length ? parts.join("; ") : "true"
-        })(), Model.OUTPUT_CAP_LARGE)
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var chunks = String(text || "").split("@@")
-        var out = []
-        for (var i = 1; i < chunks.length; i++) {
-          var nl = chunks[i].indexOf("\n")
-          if (nl < 0) continue
-          var dev = chunks[i].substring(0, nl).trim()
-          var parsed = Model.parseSmartHealth(chunks[i].substring(nl + 1))
-          if (parsed) { parsed.device = dev; out.push(parsed) }
-        }
-        root.smartList = out
-        root.smartData = out.length > 0 ? out[0] : null
-      }
     }
   }
 
@@ -1019,128 +828,6 @@ Item {
           r.command = root.selectedProcess.command
         }
         root.selectedProcess = r
-      }
-    }
-  }
-
-  // bandwhich streams continuously in raw mode and never exits, so it cannot
-  // use StdioCollector (which waits for an end that never comes) and needs no
-  // timer — `running` is bound to the window being open.
-  Process {
-    id: bandwhichProc
-    // No shell: bandwhich needs no pipes or redirection to run, so this is a
-    // direct argv command rather than a string built for bash -c. The
-    // interface name is also validated before it is ever allowed to reach a
-    // command line at all — see Model.isValidIfaceName — since this process
-    // runs under a granted capability (cap_net_raw/cap_net_admin) and a
-    // second layer of defense costs nothing here. `setsid --` still applies
-    // (unlike the other collectors, without wrapCollectorCommand's output
-    // cap — bandwhich runs continuously with -r, so a lifetime byte cap
-    // would kill it after a while of ordinary operation): this is the one
-    // collector expected to run for as long as the panel is open, so it is
-    // deliberately not on the hard-deadline watchdog, but it still runs
-    // under a granted capability and still deserves its own process group
-    // rather than sharing one with the rest of the plugin.
-    running: root.live && root.showBandwhich && root.bandwhichAvailable
-             && Model.isValidIfaceName(root.primaryIface)
-    command: ["setsid", "--", "bandwhich", "-r", "-p", "-i", root.primaryIface]
-    stdout: SplitParser {
-      onRead: function(line) {
-        // Rows are summed per process and keyed on bandwhich's refresh
-        // timestamp, so a process that stopped transmitting drops out instead
-        // of sitting at its last rate forever. Unattributed traffic sorts last.
-        root.bandwhichAccum = Model.bandwhichAccumulate(root.bandwhichAccum,
-                                                        Model.parseBandwhichLine(line))
-        root.bandwhichRows = Model.bandwhichTop(root.bandwhichAccum, 6)
-      }
-    }
-  }
-
-  // Unprivileged pre-check for both grantBandwhich and grantSmart — see the
-  // comment above those functions. Runs with no elevation at all: reading a
-  // file's path/type/owner and checking pacman's package database need no
-  // special access, so there is nothing here for pkexec to ever be asked
-  // about if this step is the one that fails.
-  Process {
-    id: grantValidateProc
-    property string pendingTarget: ""
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var v = Model.parseExecutableValidation(text)
-        if (!v.ok) {
-          root.grantBusy = ""
-          root.grantError = "cannot grant: " + v.reasons.join("; ")
-          return
-        }
-        if (grantValidateProc.pendingTarget === "bandwhich") root.proceedGrantBandwhich(v.realPath)
-        else if (grantValidateProc.pendingTarget === "smartctl") root.proceedGrantSmart(v.realPath)
-      }
-    }
-  }
-
-  Process {
-    id: grantProc
-    property string pendingLabel: ""
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        // pkexec/setcap/visudo stderr is genuinely external text with no
-        // length guarantee — bounded here, at the one place it enters the
-        // plugin, rather than trusting every later reader to bound it.
-        var m = Model.truncateDisplay(String(text || "").trim(), 300)
-        if (m !== "") root.grantError = m
-      }
-    }
-    onExited: function(exitCode) {
-      if (exitCode === 0) {
-        root.grantError = ""
-        // grantBusy deliberately stays set here rather than clearing
-        // immediately: a successful grant/revoke re-probes tool
-        // availability below, and the button that triggered this is only
-        // re-derived from that probe's result (bandwhichAvailable /
-        // smartAvailable), not from this exit alone. Clearing grantBusy
-        // here, before the probe returns, re-enables and re-shows the
-        // same button for a narrow window where its own visible state has
-        // not caught up yet, and a second click inside that window re-runs
-        // the grant: buildGrantCapabilityScript then backs up whatever
-        // capability is CURRENTLY on the target, which by then is this
-        // plugin's own just-applied one, silently overwriting the
-        // original backup with a record of the plugin's own grant.
-        // Revoke would then "restore" that, a no-op, with the true prior
-        // state gone. It needs one extra click inside a narrow window, not
-        // a timing race, which is why no automated pass caught it.
-        // probeProc's own onStreamFinished is what actually clears
-        // grantBusy now.
-        root.start(probeProc, "probeProc")   // re-probe; the section relights either way
-        return
-      }
-      root.grantBusy = ""
-      if (exitCode === 126 || exitCode === 127) {
-        // pkexec's "dismissed" and "not authorised" — a cancelled password
-        // prompt is a decision, not a failure to report.
-        root.grantError = ""
-      } else if (exitCode === 23 && root.grantAction === "revoke") {
-        // buildRevokeCapabilityScript's own refusal: no backup on file for
-        // this capability, meaning this plugin never actually granted it —
-        // most likely it predates the plugin entirely (bandwhich's own
-        // docs recommend this exact setcap line as a manual step). Nothing
-        // was touched; say so plainly rather than a bare exit code.
-        root.grantError = "not revoked: this capability was not granted by this plugin, so there is nothing on file to safely restore"
-      } else if (exitCode === 24 && root.grantAction === "grant") {
-        // Model.buildGrantSmartScript's own refusal: the account name read
-        // from the environment did not pass Model.isValidUsername, so no
-        // sudoers rule was built at all. grantSmart() already checks this
-        // synchronously before pkexec is ever invoked, so this branch is a
-        // second-layer defense (a $USER that changed between that check
-        // and this script running, or a future caller of
-        // buildGrantSmartScript that skips grantSmart()) rather than the
-        // normal path. Surfacing it plainly still matters, since a rule
-        // built from that value would have been syntactically valid and
-        // passed visudo -cf clean.
-        root.grantError = "not granted: could not validate the account name; no sudoers rule was written"
-      } else if (root.grantError === "") {
-        root.grantError = (grantProc.pendingLabel || root.grantAction || "grant") + " failed (exit " + exitCode + ")"
       }
     }
   }
@@ -1932,11 +1619,12 @@ Item {
                     font.pixelSize: root.fsCaption
                   }
 
-                  // The SENSORS list was removed: GPU temperatures already sit in
-                  // the GPU section, drive temperatures in the health rows, and
-                  // the CPU package temperature is now on the CPU header — the
-                  // section had become a second copy of all three. Sensors are
-                  // still collected, for the CPU reading and the header stat.
+                  // The SENSORS list was removed: GPU temperatures already sit
+                  // in the GPU section, drive temperatures under DISK, and the
+                  // CPU package temperature on the CPU header, so the section
+                  // had become a second copy of all three. Sensors are still
+                  // collected, and are now the only source for all three of
+                  // those readings.
                 }
 
                 Column {
@@ -1966,51 +1654,25 @@ Item {
                     }
                   }
 
+                  // One row per NVMe controller. Bounded by the hardware
+                  // itself rather than by a limit here: hwmon publishes one
+                  // node per controller present.
                   Repeater {
-                    // Row count is already bounded upstream: the collector
-                    // globs /dev/nvme?n1 (Model.COLLECT_NVME_LIST), a single
-                    // digit, so at most 10 devices are ever in smartList.
-                    model: root.showSmartHealth ? root.smartList : []
+                    model: root.driveTemps
                     delegate: Text {
                       required property var modelData
                       width: rightCol.width
                       textFormat: Text.PlainText
-                      text: Model.truncateDisplay(modelData.device.replace("/dev/", ""), 40) + "   "
-                            + Model.formatTemp(modelData.temp)
-                            + "   wear " + modelData.wearPercent + "%"
-                            + "   " + modelData.powerOnHours + "h"
-                            + "   " + modelData.mediaErrors + " err"
-                      color: modelData.mediaErrors > 0 || modelData.wearPercent >= 80
-                             ? root.urgent : root.dimmer
+                      text: Model.truncateDisplay(modelData.display, 40)
+                            + "   " + Model.formatTemp(modelData.tempC)
+                      // NVMe controllers throttle in the high seventies, so
+                      // 70 is the point where the number is worth noticing
+                      // rather than an alarm in itself.
+                      color: modelData.tempC >= 70 ? root.urgent : root.dimmer
                       font.family: root.fontFamily
                       font.pixelSize: root.fsCaption
                       elide: Text.ElideRight
                     }
-                  }
-
-                  // Says exactly what is missing and how to grant it, rather
-                  // than leaving an empty row that reads as a broken panel.
-                  Text {
-                    width: parent.width
-                    visible: root.showSmartHealth && root.smartList.length === 0
-                             && root.smartAvailable
-                    text: "drive health: reading…"
-                    color: root.dimmer
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fsCaption
-                  }
-
-                  GrantRow {
-                    width: parent.width
-                    visible: root.showSmartHealth && !root.smartAvailable
-                    explain: "Drive health (temperature, wear, error count) needs root."
-                    busy: root.grantBusy === "smartctl"
-                    onTriggered: root.grantSmart()
-                  }
-                  RevokeRow {
-                    visible: root.showSmartHealth && root.smartAvailable
-                    busy: root.grantBusy === "smartctl"
-                    onTriggered: root.revokeSmart()
                   }
 
                   PanelSeparator { width: parent.width; foreground: root.foreground }
@@ -2021,11 +1683,7 @@ Item {
                     Component.onCompleted: root.registerAnchor("network", this)
                     // Length-capped here for defense in depth; the value
                     // Text this feeds (SectionHeader's shVal, defined lower
-                    // in this file) already sets Text.PlainText. The
-                    // command-construction path for this same interface
-                    // name is separately gated by Model.isValidIfaceName
-                    // (see bandwhichProc), which is a different check for a
-                    // different purpose, not a duplicate of this one.
+                    // in this file) already sets Text.PlainText.
                     value: Model.truncateDisplay(root.primaryIface, 40)
                   }
 
@@ -2042,55 +1700,6 @@ Item {
                     font.pixelSize: root.fsBody
                   }
 
-                  Repeater {
-                    model: root.bandwhichRows
-                    delegate: Item {
-                      required property var modelData
-                      width: rightCol.width
-                      height: Style.space(15)
-
-                      Text {
-                        id: bwRates
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "↓ " + Model.formatRate(modelData.rxRate)
-                              + "   ↑ " + Model.formatRate(modelData.txRate)
-                        color: root.dimmer
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fsSmall
-                      }
-                      Text {
-                        anchors.left: parent.left
-                        anchors.right: bwRates.left
-                        anchors.rightMargin: Style.space(8)
-                        anchors.verticalCenter: parent.verticalCenter
-                        // bandwhich's own label for traffic it could not map to
-                        // a process: without root it cannot inspect another
-                        // user's sockets. Named plainly rather than left raw.
-                        textFormat: Text.PlainText
-                        text: Model.isUnattributed(modelData.process)
-                              ? "unattributed" : Model.truncateDisplay(modelData.process, 64)
-                        color: root.dimmer
-                        opacity: Model.isUnattributed(modelData.process) ? 0.7 : 1.0
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fsSmall
-                        elide: Text.ElideRight
-                      }
-                    }
-                  }
-
-                  GrantRow {
-                    width: parent.width
-                    visible: root.showBandwhich && !root.bandwhichAvailable
-                    explain: "Per-process network needs packet-capture permission."
-                    busy: root.grantBusy === "bandwhich"
-                    onTriggered: root.grantBandwhich()
-                  }
-                  RevokeRow {
-                    visible: root.showBandwhich && root.bandwhichAvailable
-                    busy: root.grantBusy === "bandwhich"
-                    onTriggered: root.revokeBandwhich()
-                  }
                 }
               }
 
@@ -2636,81 +2245,6 @@ Item {
       font.family: root.fontFamily
       font.pixelSize: root.fsCaption
       font.bold: true
-    }
-  }
-
-  // A capability the panel cannot use yet, paired with the button that grants
-  // it. States what is missing in plain terms rather than naming the syscall,
-  // and authenticates through polkit when pressed.
-  component GrantRow: Column {
-    id: gr
-    property string explain: ""
-    property bool busy: false
-    signal triggered()
-    spacing: Style.space(8)
-
-    Text {
-      width: gr.width
-      text: gr.explain
-      color: root.dimmer
-      font.family: root.fontFamily
-      font.pixelSize: root.fsCaption
-      wrapMode: Text.WordWrap
-    }
-
-    Row {
-      spacing: Style.space(12)
-
-      Button {
-        text: gr.busy ? "Authorising…" : "Enable"
-        enabled: !gr.busy
-        onClicked: gr.triggered()
-      }
-
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        visible: root.grantError !== ""
-        width: Math.max(0, gr.width - Style.space(140))
-        // Already bounded where it is set (grantProc.stderr, above) — plain
-        // text here regardless, since raw pkexec/setcap/visudo stderr is
-        // exactly the kind of content this element must never interpret as
-        // markup.
-        textFormat: Text.PlainText
-        text: root.grantError
-        color: root.urgent
-        font.family: root.fontFamily
-        font.pixelSize: root.fsCaption
-        elide: Text.ElideRight
-      }
-    }
-  }
-
-  // The opposite state from GrantRow, shown once a capability is active —
-  // the in-panel half of the uninstall path this section's review asked
-  // for: a way back to "not granted" without uninstalling the whole
-  // plugin, which `omarchy plugin remove` does not undo on its own (see
-  // README → Uninstall).
-  component RevokeRow: Row {
-    id: rr
-    property bool busy: false
-    signal triggered()
-    spacing: Style.space(8)
-
-    Text {
-      anchors.verticalCenter: parent.verticalCenter
-      text: "Enabled"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: root.fsCaption
-    }
-    PanelActionButton {
-      anchors.verticalCenter: parent.verticalCenter
-      iconText: "󰜺"
-      tooltipText: rr.busy ? "Revoking…" : "Revoke this permission"
-      foreground: root.dimmer
-      hoverColor: root.urgent
-      enabled: !rr.busy
-      onClicked: rr.triggered()
     }
   }
 

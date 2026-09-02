@@ -9,6 +9,16 @@ A comprehensive system monitoring panel for Omarchy that aggregates CPU, memory,
 **Target:** Omarchy plugin (`bar-widget` kind)  
 **Last reviewed:** 2026-08-30 (verification pass against the installed Omarchy shell + live system)
 
+> **Superseded in part, 2026-09-02.** Everything below describing privileged features is now
+> history, not current behaviour. The plugin no longer asks for any privilege at all: the
+> bandwhich per-process network rows, the `smartctl` drive-health rows, and the whole
+> `pkexec`/`setcap`/sudoers grant-and-revoke subsystem built around them were removed. Drive
+> temperature survives, read unprivileged from `hwmon` and shown under DISK; per-process network
+> bandwidth is gone, having no unprivileged equivalent on Linux. This document is kept as the
+> design record, including the five rounds of adversarial review that subsystem went through and
+> the defects each one found, since that is the reasoning that led to removing it. For what the
+> plugin actually does now, read `README.md`.
+
 > **Review note.** This revision corrects errors found by checking every claim against the shell source in `/usr/share/omarchy/shell/` and by running the commands on this machine. Five items would have broken on contact: an inverted `manageIpc`, a `Bytes` component that does not exist, an invalid `bandwhich` invocation incompatible with the collector pattern, `smartctl` requiring root, and a false "no ScrollView" rule masking a panel that overflows its own height cap. Sections 4.4b, 4.13, 4.14 and the Overflow Strategy in Section 11 are new. Verified-correct API usage is listed at the end of Section 15.
 
 ---

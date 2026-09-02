@@ -16,8 +16,6 @@
     "defaults": {
       "pollInterval": 2000,
       "showCpuPerCore": true,
-      "showSmartHealth": true,
-      "showBandwhich": true,
       "processCount": 14,
       "showAllSensors": false,
       "fontScale": 1.25

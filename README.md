@@ -65,31 +65,13 @@ second door into the same panel, not a second implementation of it.
 
 ## Uninstall
 
-If either **Permissions** section below was ever enabled, revoke it from the panel first —
-each has its own **Enabled** row with a revoke button next to the Enable button it replaced.
-That runs while the plugin is still installed and reverses exactly what enabling it did (see
-Permissions for what each one actually changes and how the revoke is scoped).
-
 ```bash
 omarchy plugin remove jharrison.sysmonitor
 ```
 
-This unregisters the plugin and stops the shell from loading it, but — like removing any
-Omarchy plugin — it does not run any uninstall step of its own, so it does **not** touch
-either granted permission. Revoking first, per above, is the supported path; if the plugin was
-already removed without doing that, the equivalent by hand is:
-
-```bash
-sudo setcap -r /usr/bin/bandwhich          # only if per-process network was ever enabled
-sudo rm -f /etc/sudoers.d/10-sysmonitor-smartctl \
-           /usr/local/bin/jharrison-sysmonitor-smart-helper   # only if drive health was ever enabled
-```
-
-The first line only makes sense if nothing else on the system also wants bandwhich's
-capability — `setcap -r` clears every capability on the binary, not just this plugin's grant.
-The in-panel revoke button does not have this caveat: it restores whatever capability (if any)
-was on the binary before this plugin's own grant, rather than clearing unconditionally, and it
-refuses to change anything at all if it never granted the capability in the first place.
+That is the whole uninstall. The panel writes nothing outside its own plugin directory, sets no
+capabilities, installs no helper scripts and adds no sudoers rules, so removing it leaves no
+permission behind to revoke and no file elsewhere on the system to clean up.
 
 The keybinding in `bindings.lua` and the window rules in `hyprland.lua` from Install are just a
 few lines you added by hand — removing the plugin does not touch either file. Leaving them in
@@ -103,8 +85,8 @@ for a clean config.
 | **CPU** | Total plus a per-thread grid, load average, pressure stall (cpu/io/mem), package temperature |
 | **Memory** | RAM, swap, and zram compression ratio |
 | **GPU** | AMD: core and memory-controller utilisation, VRAM, power against cap, sclk/mclk, fan, and all three die temps (edge / junction / mem) |
-| **Disk** | Per-filesystem usage as an animated ring gauge with the percentage in its center, deduplicated by device, plus NVMe health (temperature, wear, hours, error count) |
-| **Network** | Interface throughput and per-process traffic via bandwhich |
+| **Disk** | Per-filesystem usage as an animated ring gauge with the percentage in its center, deduplicated by device, plus NVMe drive temperature |
+| **Network** | Per-interface throughput |
 | **Processes** | CPU, threads, runtime, memory; search by name or pid; click for executable path, working directory and full ancestry; terminate, force-kill, renice, or open in `lsof` |
 
 ## Keys
@@ -138,25 +120,23 @@ This panel computes CPU the way btop does — `utime+stime` deltas between polls
 
 ## Permissions
 
-Two sections need privileges the panel does not assume. Each renders an **Enable** button that
-shells out to `pkexec`, so the polkit agent raises its own password prompt and the panel never
-handles the credential. Once granted, that button is replaced by an **Enabled** row with its
-own revoke button — see Uninstall above for what revoking actually restores.
+None. The panel runs entirely as your own user and asks for nothing.
 
-Before either ever reaches `pkexec`, the target binary is checked unprivileged: resolved to its
-real path, confirmed to be a regular file owned by root inside a trusted system directory
-(`/usr/bin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`), and, where `pacman` is present,
-confirmed to be tracked by an installed package. The drive-health grant additionally checks the
-invoking account's own name against the shape `useradd(8)` itself allows before ever building a
-sudoers line from it, since that value is otherwise handed straight to a root-owned file, and a
-sudoers principal field has no syntax of its own to reject a malformed one downstream. Nothing
-here elevates for a grant that was not going to happen anyway: any of these checks failing means
-no password prompt at all, not a prompt followed by a refusal.
+Everything on screen comes from `/proc` and `/sys`, both world-readable, plus `ps`, `df` and
+`free`, which are ordinary unprivileged commands. There is no `pkexec` call, no `sudo`, no
+`setcap`, no sudoers drop-in, no helper installed into a system directory, and no group you are
+asked to join. Install it and it works.
 
-- **Per-process network** — `setcap cap_net_raw,cap_net_admin+eip` on the bandwhich binary. Whatever capability string was already on the binary is read and saved first, so revoking restores exactly that (nothing, if there was nothing) instead of guessing. If the binary already had some other capability set by something other than this plugin, this plugin's own revoke button refuses to touch it — see Uninstall. That backup lives under this account's own state directory, which the account can write to by design, so both the grant and the revoke refuse outright (rather than following it) if that path is ever found to already be a symlink when they run.
-- **Drive health** — a small, fixed, root-owned helper script does the enumeration and the `smartctl` call; the sudoers rule grants running that one script with **no arguments**, enforced by the rule itself (an explicit empty argument spec), not only by the helper's own behavior. This replaced an earlier sudoers entry that granted `smartctl -j -a /dev/nvme*n1` directly — a command-line glob that has to be matched against whatever a caller actually invokes, rather than a bare command with nothing left in it to widen. `smartctl`'s own path is one of the binaries checked above; the resolved path is baked into the helper rather than the helper resolving `smartctl` off root's `PATH` at run time. Both the helper and the sudoers rule go through the same collision-safe install as everything else here: if either file already exists with different content — a leftover from a previous version of this plugin, or something else entirely — the existing file is copied aside with a uniquely-named `.bak` suffix before being replaced, never silently overwritten. The sudoers rule is validated with `visudo -c` before install, since a malformed drop-in can lock `sudo` out entirely. All of this is narrower than joining the `disk` group, which would grant raw read/write on every disk. Unlike bandwhich's revoke, drive health's revoke does not restore a `.bak` it finds: it removes the helper and the sudoers rule this plugin installed and leaves any pre-existing conflicting file exactly where the install-time backup put it, for manual recovery, rather than silently reinstating a file this plugin did not write.
+The one thing this costs is per-process network bandwidth. Attributing traffic to a process
+needs raw socket or eBPF access, which is privileged no matter which tool does it, so the
+NETWORK section reports per-interface throughput only. Drive temperature is unaffected and still
+shown, read from `hwmon` like every other sensor on the panel; the SMART fields that genuinely
+need root, wear level and error counts, are the deliberate omission.
 
-bandwhich's own `<UNKNOWN>` rows are shown as *unattributed*: without root it cannot map another user's socket back to a process.
+Process actions are bounded the same way. Terminate, force-kill and renice are offered only for
+processes you already own, and the panel re-checks the target's owner, command name and elapsed
+time in the same shell invocation that sends the signal, so a pid reused between the last poll
+and the keypress cannot be signalled by mistake.
 
 ## Configuration
 
@@ -166,8 +146,6 @@ bandwhich's own `<UNKNOWN>` rows are shown as *unattributed*: without root it ca
 |---|---|---|
 | `pollInterval` | `2000` | Base poll in ms |
 | `showCpuPerCore` | `true` | Per-thread CPU grid |
-| `showSmartHealth` | `true` | NVMe health rows |
-| `showBandwhich` | `true` | Per-process network |
 | `processCount` | `14` | Rows in the process table |
 | `showAllSensors` | `false` | Every hwmon reading rather than one per device |
 | `fontScale` | `1.25` | Multiplier over the theme's font tokens |
@@ -184,7 +162,7 @@ The window is resizable and tileable; nothing assumes the 1180px it opens at. Co
 node test-model.js
 ```
 
-All parsing lives in `Model.js` — pure functions plus the collector shell scripts, so the panel and the tests run byte-identical commands. The suite exercises them against this machine's real `/proc`, sysfs, `ps` and `df` output. Checks report PASS, FAIL or **SKIP**; a skip is never counted as a pass, so a capability that could not be exercised says so rather than passing silently.
+All parsing lives in `Model.js`: pure functions plus the collector shell scripts, so the panel and the tests run byte-identical commands. The suite exercises them against this machine's real `/proc`, sysfs, `ps` and `df` output. Checks report PASS, FAIL or **SKIP**; a skip is never counted as a pass. Because nothing here needs privileges, skips should normally be zero: one appearing means a genuine hardware gap on the machine running the suite (no zram, no PSI, no AMD GPU), not something the tests could not reach.
 
 A QML edit needs `omarchy-restart-shell` to take effect — the `FloatingWindow` survives hide/show, so reopening the panel keeps the old object and its stale property values.
 
@@ -192,7 +170,7 @@ A QML edit needs `omarchy-restart-shell` to take effect — the `FloatingWindow`
 
 ## Requirements
 
-Omarchy shell (Quickshell). AMD GPU section needs `amdgpu`; NVMe health needs `smartmontools`; per-process network needs `bandwhich`. Everything else reads `/proc` and sysfs directly. Sections whose source is missing hide themselves rather than rendering empty.
+Omarchy shell (Quickshell). The AMD GPU section needs an `amdgpu` card present; everything else reads `/proc` and sysfs directly, with no package to install and no permission to grant. Sections whose source is missing hide themselves rather than rendering empty.
 
 ## Licence
 
