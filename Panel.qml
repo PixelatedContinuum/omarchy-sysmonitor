@@ -731,7 +731,7 @@ Item {
   // ─────────────────────────────────────────────── collectors
   Process {
     id: probeProc
-    command: Model.wrapCollectorCommand(Model.COLLECT_TOOL_PROBE, Model.OUTPUT_CAP_TINY)
+    command: Model.wrapCollectorCommand(Model.collectToolProbe(), Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -742,6 +742,11 @@ Item {
         root.smartNeedsSudo = t.indexOf("smartctl-sudo") >= 0
         root.smartAvailable = t.indexOf("smartctl-ok") >= 0 || root.smartNeedsSudo
         if (root.smartAvailable) root.start(nvmeListProc, "nvmeListProc")
+        // Also the point where a just-finished grant's busy state clears,
+        // not grantProc.onExited itself — see the comment there. Runs on
+        // every probe, including the plain panel-open one, where grantBusy
+        // is already "" and this is a no-op.
+        root.grantBusy = ""
       }
     }
   }
@@ -886,17 +891,33 @@ Item {
 
   Process {
     id: smartProc
-    // One invocation per drive, separated by a marker, so both NVMe devices
-    // report rather than only the first. `sudo -n` never prompts: if the
-    // sudoers entry is missing it fails immediately and the row says so.
-    command: Model.wrapCollectorCommand((function() {
-      var pre = root.smartNeedsSudo ? "sudo -n " : ""
-      var parts = []
-      for (var i = 0; i < root.nvmeDevices.length; i++)
-        parts.push("echo '@@" + root.nvmeDevices[i] + "'; "
-                   + pre + "smartctl -j -a '" + root.nvmeDevices[i] + "' 2>/dev/null")
-      return parts.length ? parts.join("; ") : "true"
-    })(), Model.OUTPUT_CAP_LARGE)
+    // Elevated case: invoke the fixed root-owned helper bare, no arguments,
+    // no per-device loop, since it does its own /dev/nvme*n1 enumeration and
+    // already emits the same "@@$device" marker format parsed below, and
+    // the sudoers grant permits exactly this one command with an explicit
+    // empty-argument spec, nothing to pass it even if we wanted to.
+    // `sudo -n` never prompts: if the sudoers entry is missing it fails
+    // immediately and the row says so. Unprivileged case is unchanged: one
+    // direct smartctl invocation per drive, since there's no helper doing
+    // enumeration outside the elevated path.
+    command: Model.wrapCollectorCommand(root.smartNeedsSudo
+      ? "sudo -n " + Model.SMART_HELPER_PATH
+      : (function() {
+          // Model.isValidNvmeDevice gates entry into this string the same
+          // way Model.isValidIfaceName gates bandwhichProc's command, even
+          // though the source enumeration (COLLECT_NVME_LIST) is a fixed
+          // glob no ordinary user can steer: relying on an upstream source's
+          // assumed-safe shape is exactly the assumption review point 3
+          // warned against, and this was the one sibling collector that had
+          // not gotten it yet.
+          var parts = []
+          for (var i = 0; i < root.nvmeDevices.length; i++) {
+            if (!Model.isValidNvmeDevice(root.nvmeDevices[i])) continue
+            parts.push("echo '@@" + root.nvmeDevices[i] + "'; "
+                       + "smartctl -j -a '" + root.nvmeDevices[i] + "' 2>/dev/null")
+          }
+          return parts.length ? parts.join("; ") : "true"
+        })(), Model.OUTPUT_CAP_LARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -1061,11 +1082,30 @@ Item {
       }
     }
     onExited: function(exitCode) {
-      root.grantBusy = ""
       if (exitCode === 0) {
         root.grantError = ""
+        // grantBusy deliberately stays set here rather than clearing
+        // immediately: a successful grant/revoke re-probes tool
+        // availability below, and the button that triggered this is only
+        // re-derived from that probe's result (bandwhichAvailable /
+        // smartAvailable), not from this exit alone. Clearing grantBusy
+        // here, before the probe returns, re-enables and re-shows the
+        // same button for a narrow window where its own visible state has
+        // not caught up yet, and a second click inside that window re-runs
+        // the grant: buildGrantCapabilityScript then backs up whatever
+        // capability is CURRENTLY on the target, which by then is this
+        // plugin's own just-applied one, silently overwriting the
+        // original backup with a record of the plugin's own grant.
+        // Revoke would then "restore" that, a no-op, with the true prior
+        // state gone. It needs one extra click inside a narrow window, not
+        // a timing race, which is why no automated pass caught it.
+        // probeProc's own onStreamFinished is what actually clears
+        // grantBusy now.
         root.start(probeProc, "probeProc")   // re-probe; the section relights either way
-      } else if (exitCode === 126 || exitCode === 127) {
+        return
+      }
+      root.grantBusy = ""
+      if (exitCode === 126 || exitCode === 127) {
         // pkexec's "dismissed" and "not authorised" — a cancelled password
         // prompt is a decision, not a failure to report.
         root.grantError = ""

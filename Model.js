@@ -65,15 +65,34 @@ var COLLECT_GPU_PATH =
 // Probes the three tools whose mere presence on PATH does not mean they work
 // here: bandwhich needs CAP_NET_RAW, smartctl needs root. Each line is
 // emitted only when the capability genuinely exists.
-var COLLECT_TOOL_PROBE =
-  'if command -v bandwhich >/dev/null 2>&1 && ' +
-     'getcap "$(command -v bandwhich)" 2>/dev/null | grep -q cap_net_raw; ' +
-     'then echo bandwhich-ok; fi; ' +
-  'if command -v smartctl >/dev/null 2>&1; then ' +
-     'if smartctl -j -a /dev/nvme0n1 >/dev/null 2>&1; then echo smartctl-ok; ' +
-     'elif sudo -n smartctl -j -a /dev/nvme0n1 >/dev/null 2>&1; then echo smartctl-sudo; fi; ' +
-   'fi; ' +
-  'true'
+//
+// A function, not a plain string constant, specifically so it can
+// reference SMART_HELPER_PATH (declared much later in this file): a
+// forward reference inside a function body is fine, since nothing calls
+// this until every top-level var in the module has already been assigned;
+// the same reference inside a plain string-concatenation constant
+// evaluated at module-load time would have silently captured `undefined`.
+//
+// The elevated smartctl branch tests the fixed helper via sudo, not
+// smartctl directly: an earlier version of this probe (and of smartProc's
+// own collector, below) kept testing/running `sudo -n smartctl ...`
+// directly even after the sudoers grant was redesigned to permit only the
+// helper with no arguments, so the probe and the actual collector were
+// both silently testing and using a command the new sudoers rule no
+// longer grants. Found only by checking what the currently-active grant
+// on this machine actually permits (`sudo -n -l`), not by reading the
+// code that builds the grant, since the plugin's own generated sudoers
+// rule was never actually exercised end to end before that check.
+function collectToolProbe() {
+  return 'if command -v bandwhich >/dev/null 2>&1 && ' +
+       'getcap "$(command -v bandwhich)" 2>/dev/null | grep -q cap_net_raw; ' +
+       'then echo bandwhich-ok; fi; ' +
+     'if command -v smartctl >/dev/null 2>&1; then ' +
+       'if smartctl -j -a /dev/nvme0n1 >/dev/null 2>&1; then echo smartctl-ok; ' +
+       'elif sudo -n ' + SMART_HELPER_PATH + ' >/dev/null 2>&1; then echo smartctl-sudo; fi; ' +
+     'fi; ' +
+     'true'
+}
 
 // Enumerates the NVMe block devices so SMART is not hard-coded to one drive.
 var COLLECT_NVME_LIST =
@@ -471,6 +490,24 @@ function isValidIfaceName(name) {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,14}$/.test(String(name || ""))
 }
 
+// Same reasoning, same shape of fix, for the NVMe device paths smartProc's
+// non-elevated branch splices into a shell string with no `sq()` quoting
+// and no allow-list, the one collector command review point 3 named the
+// pattern for (bandwhich's interface name) that did not actually get it.
+// Not reachable today, COLLECT_NVME_LIST's own source is a fixed
+// `for d in /dev/nvme?n1; do [ -b "$d" ] && echo "$d"; done`, so poisoning
+// it needs root to mknod a device named with a quote, but an upstream
+// data source's assumed-safe character set is exactly the kind of thing
+// that stops being true the moment any part of that chain changes, the
+// same argument isValidIfaceName's own comment makes. `?` in that glob
+// matches exactly one character, so this only ever needs to accept
+// single-digit controller numbers in practice, but the digit run is left
+// unbounded rather than pinned to one, so a future widening of the source
+// glob does not silently start failing every real device again.
+function isValidNvmeDevice(path) {
+  return /^\/dev\/nvme[0-9]+n[0-9]+$/.test(String(path || ""))
+}
+
 // Checked even though the value normally comes straight from $USER for
 // the already-logged-in account, not attacker input in the ordinary case,
 // the same reasoning as isValidIfaceName above: relying on an upstream
@@ -713,7 +750,39 @@ function parseExecutableValidation(output) {
 function buildGrantCapabilityScript(path, capString, backupPath) {
   var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
   var bp = sq(String(backupPath || ""))
-  var bdir = sq(String(backupPath || "").replace(/\/[^/]*$/, ""))
+  var bdirRaw = String(backupPath || "").replace(/\/[^/]*$/, "")
+  var bdir = sq(bdirRaw)
+  // Every ancestor of the backup directory, not just its immediate parent.
+  // Round-4 adversarial review found the previous guard checked only bdir
+  // itself and bp (the leaf file) for -L, and demonstrated the gap directly:
+  // replacing ~/.local/state itself with a symlink, two levels above bdir,
+  // sails straight past both checks, since bdir's own name is a perfectly
+  // ordinary directory once its parent has already been swapped, and
+  // `mkdir -p` silently follows a symlinked intermediate component rather
+  // than refusing it. Walking every prefix of bdir's path and refusing if
+  // any one of them is a symlink closes that gap regardless of which level
+  // the plant happens at, not just the bottom two.
+  //
+  // Verified empirically, not assumed from the shape alone: a fresh
+  // install where no ancestor exists yet still passes (`-L` on a path that
+  // does not exist is false, not an error, so this does not wrongly refuse
+  // every first-ever grant), a normal install with real directories at
+  // every level passes, and a symlink planted at the leaf, at the
+  // immediate parent, and two levels up are all three refused. An earlier
+  // draft of this fix compared readlink -f's resolution of the whole
+  // directory against the literal expected path in one shot, which is
+  // simpler but wrong: readlink -f requires every component but the last
+  // to already exist, so it fails outright (and would have refused) on
+  // the fresh-install case, which is the most common case this code path
+  // actually runs. Found by testing that draft against a genuinely empty
+  // ancestor chain before shipping it, not by reasoning about it.
+  var bdirParts = bdirRaw.split("/").filter(function(p) { return p !== "" })
+  var ancestorGuard = ""
+  var prefix = ""
+  for (var i = 0; i < bdirParts.length; i++) {
+    prefix += "/" + bdirParts[i]
+    ancestorGuard += "[ ! -L " + sq(prefix) + " ] || exit 25; "
+  }
   return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
     "case \"$real\" in /usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*) : ;; *) exit 20 ;; esac; " +
     "[ -f \"$real\" ] && [ ! -L \"$real\" ] || exit 21; " +
@@ -734,22 +803,48 @@ function buildGrantCapabilityScript(path, capString, backupPath) {
     // This whole script runs as root (pkexec), and backupPath lives under
     // the invoking user's own writable home directory (see the comment
     // above), a directory the user, or anything running as them, could
-    // have pre-planted a symlink in. `printf > backupPath` would follow
-    // that symlink and let a root-privileged write land wherever it
-    // points. `-L` (not `-e`) is what actually catches this: `-e` follows
-    // a symlink to check whether ITS TARGET exists, so a dangling symlink
-    // reads as "nothing here yet" and would sail through an `-e`-based
-    // check straight into mkdir/the write. `-L` uses lstat semantics and
-    // reports "this path is a symlink" regardless of whether it resolves.
-    // Verified directly: a plain `>` redirect follows a symlink to its
-    // target, and `mv` replaces the symlink itself instead of writing
-    // through it, so the actual write goes through a freshly mktemp'd file
-    // and mv, not a redirect into the destination path.
-    "[ ! -L " + bdir + " ] || exit 25; " +
+    // have pre-planted a symlink in, at any level, not just the immediate
+    // parent (see the ancestor-walk comment above bdirParts). `printf >
+    // backupPath` would follow that symlink and let a root-privileged
+    // write land wherever it points. `-L` (not `-e`) is what actually
+    // catches this: `-e` follows a symlink to check whether ITS TARGET
+    // exists, so a dangling symlink reads as "nothing here yet" and would
+    // sail through an `-e`-based check straight into mkdir/the write. `-L`
+    // uses lstat semantics and reports "this path is a symlink" regardless
+    // of whether it resolves. Verified directly: a plain `>` redirect
+    // follows a symlink to its target, and `mv` replaces the symlink
+    // itself instead of writing through it, so the actual write goes
+    // through a freshly mktemp'd file and mv, not a redirect into the
+    // destination path.
+    ancestorGuard +
     "mkdir -p -- " + bdir + " || exit 25; " +
     "[ ! -L " + bp + " ] || exit 25; " +
     "bt=$(mktemp) && printf '%s' \"$old\" > \"$bt\" && mv -f \"$bt\" " + bp + " && " +
-    "setcap " + sq(String(capString || "")) + " -- \"$real\""
+    // No `--` before "$real": found only by actually running this command
+    // privileged (unshare -Ur, matching the survey method used elsewhere in
+    // this file) rather than trusting that `--` means what it means for
+    // every other tool used here. setcap has no getopt-style option
+    // terminator at all; its own usage string pairs arguments strictly
+    // positionally, (capsOrFlag, filename) repeating, so `--` is consumed
+    // as the FILENAME of the current pair, not as a separator, and the
+    // real target is left as an orphaned, silently-ignored extra argument.
+    // Confirmed directly: `setcap 'cap_net_raw=ep' -- /path/to/target`
+    // fails with "Failed to set capabilities on file '--': No such file or
+    // directory" and getcap on the real target afterward shows no change,
+    // while the identical command with `--` simply omitted succeeds and
+    // getcap confirms it. This has been in every setcap invocation in this
+    // file since the plugin's first commit; every prior test and every
+    // adversarial pass ran unprivileged, where setcap fails at the
+    // permission check before argument parsing is ever reached, so no
+    // prior run could have told this apart from an ordinary unprivileged
+    // failure. Dropping `--` is safe, not just necessary: setcap's
+    // filename slot is positional regardless of its own content (verified
+    // separately against a real target file named with a leading hyphen),
+    // and the caps/flag slot immediately before it is either a fixed
+    // string literal at each call site (capString here) or already
+    // guarded against a leading hyphen (buildRevokeCapabilityScript's
+    // "$old", see its own case statement).
+    "setcap " + sq(String(capString || "")) + " \"$real\""
 }
 
 // Restores whatever capability string buildGrantCapabilityScript backed
@@ -789,28 +884,89 @@ function buildRevokeCapabilityScript(path, backupPath) {
     // to root's setcap. Real getcap output across this system (surveyed
     // directly, not assumed: newgidmap, newuidmap, btop, rcp/rlogin/rsh,
     // gsr-kms-server, bandwhich) is consistently "cap_name[,cap_name...]
-    // =flags" with no `+`/`-` and no spaces, so the charset check below
-    // allows exactly that range and refuses anything else. It is a shape
-    // filter, not a full parser: setcap's own parser, already proven
-    // strict (it rejects getcap's combined "path capspec" form outright),
-    // is what decides whether the surviving string is actually
-    // well-formed, the same division of labor visudo -cf has elsewhere in
-    // this codebase.
+    // =flags" with no `+`/`-` and no spaces, but that survey describes what
+    // happens to be granted on this one system, not the full format setcap
+    // and getcap actually accept. cap_text_formats(7), the authoritative
+    // spec, allows one or more whitespace-separated clauses, each using
+    // `=`, `+`, or `-` as its operator, and an adversarial pass caught that
+    // the original charset was narrower than that real spec: a legitimate
+    // multi-clause backup, or one using `+`/`-`, would have been refused
+    // rather than restored, indistinguishable from an actual injection
+    // attempt. The charset below now allows the full documented range,
+    // letters, digits, underscore, comma, the three operators, and the
+    // whitespace that separates clauses, verified against both real
+    // capability strings and a battery of injection attempts before this
+    // was written. It remains a shape filter, not a full parser: setcap's
+    // own parser, already proven strict (it rejects getcap's combined
+    // "path capspec" form outright), is what decides whether the surviving
+    // string is actually well-formed, the same division of labor
+    // visudo -cf has elsewhere in this codebase.
     //
-    // rc is captured explicitly and exited at the end rather than left to
-    // whatever the trailing `rm -f` returns: `rm -f` on a file that is
-    // there almost always succeeds, so without this, a failed setcap
-    // (wrong privilege, or a charset-passing string setcap's own parser
-    // still rejects) would have reported success anyway, since cleanup
-    // ran last. Found while testing the fix above, not assumed correct
-    // because it looked like the (correct) shape already used in
+    // rc is captured explicitly in every branch, including the empty-backup
+    // one, rather than assumed or left to whatever the trailing cleanup
+    // command returns: a failed setcap (wrong privilege, or a
+    // charset-passing string setcap's own parser still rejects) needs to be
+    // reported as the failure it is, not masked as success because cleanup
+    // ran last and cleanup usually succeeds. The cleanup itself now runs
+    // only on success: a failed restore, whichever branch it failed in,
+    // leaves the backup file in place rather than deleting the one record
+    // of what to restore, so a retry after the underlying problem is fixed
+    // still has something to restore from. Both found while testing the
+    // charset widening above, not assumed correct because the surrounding
+    // shape looked like the (correct) pattern already used in
     // buildCollisionSafeInstallScript below.
+    //
+    // Widening the charset to allow `-` (needed for the legitimate
+    // "cap_foo-e" remove-flag clause) opened a separate gap, found by
+    // testing setcap's own argument handling directly rather than assumed
+    // safe because the charset change looked complete on its own: $old is
+    // setcap's first positional argument, so a backup holding exactly "-r"
+    // or "--help" is not a syntactically-invalid capability string that
+    // setcap cleanly rejects, it is setcap's own flag, and gets executed
+    // as one (confirmed directly: `setcap "-r" /usr/bin/bash` reached the
+    // exact same code path as an explicit `setcap -r`). No real capability
+    // clause ever begins with a hyphen, cap_text_formats(7) only allows
+    // `-` as a mid-clause flag operator, so refusing any value that starts
+    // with one closes this without narrowing what a real backup can
+    // contain.
+    //
+    // Neither setcap call below has a `--` in front of "$real" (an earlier
+    // version of both this comment and the code had one, on the mistaken
+    // assumption that it protects $real the way it would for a coreutils
+    // command): see buildGrantCapabilityScript's setcap line for why that
+    // assumption is wrong for setcap specifically, and why $real does not
+    // need that protection anyway.
+    //
+    // The empty-backup branch's rc=$? is the literal exit status of
+    // `setcap -r`, which is not quite the same question as "did the
+    // restore succeed": setcap -r on a file that already has no
+    // capability to remove exits nonzero too (confirmed directly, under
+    // real privilege, against a file with nothing on it), and that is
+    // this branch's single most common case, a user whose bandwhich had
+    // no capability before this plugin's own grant. Rather than pattern
+    // match setcap's own error text, which is not guaranteed stable
+    // across libcap versions or locales, a failed attempt is followed by
+    // one more getcap on the same target: if it now reports no capability
+    // at all, the end state this branch exists to reach was already
+    // reached (this plugin's own grant may have simply never taken, or a
+    // package upgrade replaced the binary with a fresh, capability-less
+    // inode since the grant, both real scenarios, not just theoretical),
+    // and rc is corrected to 0. If getcap still shows a capability, the
+    // failure was real (wrong privilege, read-only filesystem, an
+    // immutable bit) and rc is left exactly as setcap reported it.
+    // Verified across all three shapes before writing this: already
+    // clear, genuinely has a capability (setcap -r succeeds directly, this
+    // check never even triggers), and a real failure with the capability
+    // still present (rc correctly stays nonzero, not masked).
     "case \"$old\" in " +
-    "  '') setcap -r -- \"$real\" 2>/dev/null; rc=0 ;; " +
-    "  *[!A-Za-z0-9_,=]*) rc=26 ;; " +
-    "  *) setcap \"$old\" -- \"$real\"; rc=$? ;; " +
+    "  '') setcap -r \"$real\" 2>/dev/null; rc=$?; " +
+    "      if [ \"$rc\" -ne 0 ] && [ -z \"$(getcap -- \"$real\" 2>/dev/null)\" ]; then rc=0; fi ;; " +
+    "  -*) rc=26 ;; " +
+    "  *[!A-Za-z0-9_,=+\\ -]*) rc=26 ;; " +
+    "  *) setcap \"$old\" \"$real\"; rc=$? ;; " +
     "esac; " +
-    "rm -f " + bp + "; exit $rc"
+    "[ \"$rc\" -eq 0 ] && rm -f " + bp + "; " +
+    "exit $rc"
 }
 
 // Installs `content` at targetPath, but never as a blind overwrite:
@@ -1495,7 +1651,7 @@ if (typeof module !== "undefined" && module.exports) {
     COLLECT_FANS: COLLECT_FANS,
     COLLECT_PRESSURE: COLLECT_PRESSURE,
     COLLECT_GPU_PATH: COLLECT_GPU_PATH,
-    COLLECT_TOOL_PROBE: COLLECT_TOOL_PROBE,
+    collectToolProbe: collectToolProbe,
     COLLECT_NVME_LIST: COLLECT_NVME_LIST,
     COLLECT_PROC_SNAPSHOT: COLLECT_PROC_SNAPSHOT,
     parseProcSnapshot: parseProcSnapshot,
@@ -1550,6 +1706,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildGrantSmartScript: buildGrantSmartScript,
     buildRevokeSmartScript: buildRevokeSmartScript,
     isValidIfaceName: isValidIfaceName,
+    isValidNvmeDevice: isValidNvmeDevice,
     isValidUsername: isValidUsername,
     truncateDisplay: truncateDisplay,
     formatState: formatState,

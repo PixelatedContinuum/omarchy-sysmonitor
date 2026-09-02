@@ -172,6 +172,26 @@ check("live default-route interface name (if any) passes the validator", (functi
   return M.isValidIfaceName(iface)
 })())
 
+section("isValidNvmeDevice — the gate before an NVMe device path reaches smartProc's unprivileged command")
+check("accepts ordinary NVMe device paths",
+      ["/dev/nvme0n1", "/dev/nvme1n1", "/dev/nvme9n1"]
+        .every(function(n) { return M.isValidNvmeDevice(n) }))
+check("rejects shell metacharacters that would matter if this were ever shell-interpolated",
+      ["/dev/nvme0n1; rm -rf /", "/dev/nvme0n1 && whoami", "/dev/nvme0n1`id`", "/dev/nvme0n1$(id)",
+       "/dev/nvme0n1|id", "/dev/nvme0n1\nid", "/dev/nvme0n1 ", " /dev/nvme0n1", "/dev/nvme0n1'"]
+        .every(function(n) { return !M.isValidNvmeDevice(n) }))
+check("rejects paths outside /dev/nvme*n* shape, including a path traversal attempt",
+      ["/etc/passwd", "/dev/sda", "/dev/nvme0", "/dev/nvme0n1p1", "nvme0n1", "/dev/../etc/passwd",
+       "/dev/nvme0n1/../../etc/passwd"]
+        .every(function(n) { return !M.isValidNvmeDevice(n) }))
+check("rejects empty, null, and non-string input",
+      !M.isValidNvmeDevice("") && !M.isValidNvmeDevice(null) && !M.isValidNvmeDevice(undefined))
+check("live NVMe devices on this machine (if any) pass the validator", (function() {
+  var devices = (sh("for d in /dev/nvme?n1; do [ -b \"$d\" ] && echo \"$d\"; done") || "").trim().split("\n").filter(function(d) { return d })
+  if (!devices.length) return true // no NVMe devices on this box right now — not a validator failure
+  return devices.every(function(d) { return M.isValidNvmeDevice(d) })
+})())
+
 section("isValidUsername — the gate before an account name reaches a sudoers principal field")
 check("accepts ordinary usernames",
       ["jharrison", "root", "_apt", "www-data", "user123", "a", "user-name"]
@@ -643,6 +663,31 @@ check("live: grant refuses (exit 25) when the backup's CONTAINING DIRECTORY is a
         fs.unlinkSync(protectedFile); fs.unlinkSync(backupDir)
         return !r.ok && r.status === 25 && untouched
       })())
+check("live: grant refuses (exit 25) when an ancestor TWO LEVELS ABOVE the backup file is a pre-planted symlink, not just the immediate parent",
+      (function() {
+        // Round-4 adversarial review's own finding: the previous guard
+        // checked only bdir (the immediate parent) and the leaf file, so
+        // swapping a HIGHER ancestor, ~/.local/state itself in the real
+        // plugin path, sailed straight past both, since mkdir -p silently
+        // follows a symlinked intermediate component rather than refusing
+        // it. This reproduces that exact shape: the immediate parent and
+        // the leaf are both perfectly ordinary, only the grandparent is a
+        // symlink.
+        var elsewhere = "/tmp/sysmonitor-test-ancestor-elsewhere-" + process.pid
+        var base = "/tmp/sysmonitor-test-ancestor-base-" + process.pid
+        var swapped = base + "/swapped"      // this one becomes the symlink
+        var backupPath = swapped + "/state/cap.bak"
+        try { fs.rmSync(base, { recursive: true, force: true }) } catch (e) {}
+        try { fs.rmSync(elsewhere, { recursive: true, force: true }) } catch (e) {}
+        fs.mkdirSync(base, { recursive: true })
+        fs.mkdirSync(elsewhere, { recursive: true })
+        fs.symlinkSync(elsewhere, swapped)
+        var r = runScript(M.buildGrantCapabilityScript("/usr/bin/bash", "cap_net_raw+eip", backupPath))
+        var leakedThrough = fs.existsSync(elsewhere + "/state")
+        fs.rmSync(base, { recursive: true, force: true })
+        fs.rmSync(elsewhere, { recursive: true, force: true })
+        return !r.ok && r.status === 25 && !leakedThrough
+      })())
 check("live: grant succeeds normally against a non-symlinked backup path (the guards do not false-positive on the happy path)",
       (function() {
         var backupDir = "/tmp/sysmonitor-test-legit-dir-" + process.pid
@@ -680,44 +725,113 @@ check("revoke refuses (exit 23) when no backup file exists, rather than strippin
         var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
         return !r.ok && r.status === 23
       })())
-check("revoke proceeds past the backup-exists guard when a backup file exists (empty backup: rc forced to 0, matching \"nothing to restore\")",
+check("revoke proceeds past the backup-exists guard when a backup file exists (empty backup, target already has no capability: the getcap recheck reports success rather than surfacing setcap -r's own \"nothing to remove\" exit)",
       (function() {
+        // /usr/bin/bash genuinely has no capability on a normal system, so
+        // even run fully unprivileged, `setcap -r` on it fails not because
+        // of a permission problem but because there is nothing to remove
+        // (confirmed directly, under real privilege, against a fresh
+        // capability-less file: same "nothing to remove" failure, not an
+        // EPERM). The empty-backup branch exists specifically to reach "no
+        // capability present", which is already true here, so the
+        // getcap-recheck should report success and clean up the backup,
+        // not surface setcap -r's own nonzero exit as a plugin-level
+        // failure. The genuine-failure case, a real capability that a real
+        // permission problem prevents removing, is exercised separately
+        // below with actual privilege, since this scenario cannot
+        // distinguish "nothing to remove" from "not permitted" on its own.
         var backupPath = "/tmp/sysmonitor-test-has-backup-" + process.pid + ".bak"
         fs.writeFileSync(backupPath, "")   // "" is a legitimate backup: there was nothing before our grant
         var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
-        // A successful pass through the backup-exists guard removes the
-        // backup file itself (see buildRevokeCapabilityScript's `rm -f`),
-        // whether that happened or not, don't fail cleanup over it.
+        var cleanedUp = !fs.existsSync(backupPath)
         try { fs.unlinkSync(backupPath) } catch (e) {}
-        // Not 23 (the backup-exists guard let it through) and, since an
-        // empty backup means "strip to nothing", not a failure either,
-        // even though the underlying unprivileged setcap -r may itself
-        // not actually apply.
-        return r.status !== 23 && r.ok
+        return r.ok && cleanedUp
       })())
-check("live: a real (non-empty) capability restore surfaces setcap's actual exit status, not the trailing cleanup's",
+var canUnshareSetcap = (function() {
+  // Whether this environment permits unprivileged user namespaces with
+  // real CAP_SETFCAP inside them (`unshare -Ur setcap ...`), the same
+  // technique used to hand-verify every privileged code path in this file
+  // without needing actual root. Some hardened systems and CI containers
+  // disable unprivileged user namespaces entirely
+  // (kernel.unprivileged_userns_clone=0 or an equivalent), so this is
+  // probed once and the one test that needs it is skipped, not failed,
+  // when it is unavailable, matching every other environment-dependent
+  // skip in this file.
+  var probeFile = "/tmp/sysmonitor-test-unshare-probe-" + process.pid
+  try {
+    fs.writeFileSync(probeFile, "")
+    cp.execFileSync("unshare", ["-Ur", "setcap", "cap_net_raw=ep", probeFile], { stdio: ["ignore", "ignore", "ignore"] })
+    var out = cp.execFileSync("unshare", ["-Ur", "getcap", "--", probeFile], { encoding: "utf8" })
+    return out.indexOf("cap_net_raw") >= 0
+  } catch (e) { return false }
+  finally { try { fs.unlinkSync(probeFile) } catch (e) {} }
+})()
+if (!canUnshareSetcap) {
+  skipped("live: empty-backup revoke does not mask a genuine failure when the target still has a capability the unprivileged attempt could not strip", "unshare -Ur + setcap unavailable in this environment (unprivileged user namespaces likely restricted)")
+} else {
+  check("live: empty-backup revoke does not mask a genuine failure when the target still has a capability the unprivileged attempt could not strip",
+        (function() {
+          // The companion case to the test above: this time the target
+          // GENUINELY has a capability (set with real privilege via
+          // unshare -Ur, mirroring how the actual plugin would have gotten
+          // it there through pkexec), and the revoke attempt itself runs
+          // fully unprivileged, exactly like every other "live" check in
+          // this file. The getcap recheck must not fire here: the
+          // capability is still present afterward, so rc has to surface
+          // the real failure, not 0, and the backup that failed attempt
+          // could not consume has to survive.
+          var target = "/tmp/sysmonitor-test-empty-backup-realcap-" + process.pid
+          fs.writeFileSync(target, fs.readFileSync("/bin/true"))
+          fs.chmodSync(target, 0o755)
+          try { cp.execFileSync("unshare", ["-Ur", "setcap", "cap_net_raw=ep", target], { stdio: ["ignore", "ignore", "ignore"] }) } catch (e) {}
+          var backupPath = "/tmp/sysmonitor-test-empty-backup-realcap-" + process.pid + ".bak"
+          fs.writeFileSync(backupPath, "")
+          var r = runScript(M.buildRevokeCapabilityScript(target, backupPath))
+          var preserved = fs.existsSync(backupPath)
+          var stillHasCap = (function() {
+            try { return cp.execFileSync("getcap", ["--", target], { encoding: "utf8" }).indexOf("cap_net_raw") >= 0 }
+            catch (e) { return false }
+          })()
+          try { fs.unlinkSync(backupPath) } catch (e) {}
+          try { fs.unlinkSync(target) } catch (e) {}
+          return !r.ok && r.status !== 23 && r.status !== 26 && preserved && stillHasCap
+        })())
+}
+check("live: a real (non-empty) capability restore surfaces setcap's actual exit status, and preserves the backup on failure rather than destroying its own retry record",
       (function() {
-        // Regression for a real bug found while testing the fix above:
-        // the script used to end with an unconditional `rm -f` as its
-        // last command, so its own exit code was rm's, not setcap's.
-        // `rm -f` on an existing file almost always succeeds, so a
-        // FAILED restore (wrong privilege, here; a rejected string in
-        // production) would have silently reported success.
+        // Regression for two real bugs found while testing the fix above.
+        // First, the script used to end with an unconditional `rm -f` as
+        // its last command, so its own exit code was rm's, not setcap's.
+        // `rm -f` on an existing file almost always succeeds, so a FAILED
+        // restore (wrong privilege, here; a rejected string in production)
+        // would have silently reported success. Second, that same
+        // unconditional `rm -f` deleted the backup even when the restore
+        // had failed, so a retry after the underlying problem was fixed
+        // had nothing left to restore from.
         var backupPath = "/tmp/sysmonitor-test-real-backup-" + process.pid + ".bak"
         fs.writeFileSync(backupPath, "cap_net_raw=eip")   // getcap's own "=" shape, not the "+" a caller passes to REQUEST a capability
         var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
-        var cleanedUp = !fs.existsSync(backupPath)
+        var preserved = fs.existsSync(backupPath)
         try { fs.unlinkSync(backupPath) } catch (e) {}
         // Unprivileged in this test run, so setcap itself fails; the
         // property under test is that the script's own exit code reflects
-        // that (not 0, not the guard codes 20/23/26), while still cleaning
-        // up the backup file regardless.
-        return !r.ok && r.status !== 20 && r.status !== 23 && r.status !== 26 && cleanedUp
+        // that (not 0, not the guard codes 20/23/26), and that the backup
+        // this failed attempt could not consume is still there afterward.
+        return !r.ok && r.status !== 20 && r.status !== 23 && r.status !== 26 && preserved
       })())
 check("live: revoke refuses (exit 26) content written directly into the backup file, no symlink involved, that doesn't match a real capability shape",
       (function() {
         var backupPath = "/tmp/sysmonitor-test-bad-content-" + process.pid + ".bak"
-        var attempts = ["; rm -rf /", "cap_net_raw=eip; id", "cap_net_raw=eip $(id)", "cap_net_raw eip", "path/like/thing cap_x=e", "cap_sys_admin+eip"]
+        // cap_sys_admin+eip and a bare space-separated clause pair moved
+        // out of this list: widening the charset to match the real
+        // cap_text_formats(7) spec means both are now legitimate shapes,
+        // covered by their own accepted-format check below, not attacks.
+        // The two new entries here probe that widening specifically: a
+        // still-disallowed character tacked onto an otherwise-plausible
+        // multi-clause or `+`-using string, to confirm the widening did
+        // not accidentally create room to hide one.
+        var attempts = ["; rm -rf /", "cap_net_raw=eip; id", "cap_net_raw=eip $(id)", "path/like/thing cap_x=e",
+                         "cap_net_raw=ep cap_x=e; id", "cap_net_raw=ep+$(id)"]
         var allRefused = attempts.every(function(bad) {
           fs.writeFileSync(backupPath, bad)
           var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
@@ -725,6 +839,57 @@ check("live: revoke refuses (exit 26) content written directly into the backup f
         })
         try { fs.unlinkSync(backupPath) } catch (e) {}
         return allRefused
+      })())
+check("live: revoke refuses (exit 26) backup content starting with a hyphen, rather than letting setcap parse it as setcap's own flag",
+      (function() {
+        // $old is setcap's first positional argument, so without this
+        // guard a backup holding exactly "-r" would run as setcap's own
+        // remove-capability flag, not fail as a malformed capability
+        // string. Confirmed directly: `setcap "-r" <file>` reaches the
+        // same code path as `setcap -r <file>`. cap_text_formats(7) never
+        // has a clause begin with a hyphen, so refusing a leading one
+        // costs nothing legitimate.
+        var backupPath = "/tmp/sysmonitor-test-leading-hyphen-" + process.pid + ".bak"
+        var attempts = ["-r", "--help", "-h", "-fv", "-"]
+        var allRefused = attempts.every(function(bad) {
+          fs.writeFileSync(backupPath, bad)
+          var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+          return r.status === 26
+        })
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return allRefused
+      })())
+check("live: the widened charset now accepts real multi-clause and +/- capability formats the narrower guard used to wrongly refuse",
+      (function() {
+        var backupPath = "/tmp/sysmonitor-test-widened-format-" + process.pid + ".bak"
+        // All four are real, well-formed cap_text_formats(7) strings: a
+        // `+`-operator clause (add), a `-`-operator clause (remove), and
+        // two whitespace-separated multi-clause strings. None contain the
+        // disallowed characters, so none should be refused at the charset
+        // stage (status 26); they proceed to setcap, which fails here only
+        // because this test runs unprivileged.
+        var attempts = ["cap_net_raw+ei", "cap_net_raw-e", "cap_net_raw=ep cap_sys_admin=e", "cap_net_raw,cap_net_admin=eip cap_sys_ptrace=i"]
+        var noneRefusedByCharset = attempts.every(function(good) {
+          fs.writeFileSync(backupPath, good)
+          var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+          return r.status !== 26
+        })
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return noneRefusedByCharset
+      })())
+check("live: a charset-valid but grammatically malformed capability string passes the shape filter and is still rejected, just by setcap itself rather than at 26",
+      (function() {
+        // "cap_net_raw eip" is letters, underscore, and a space, all in
+        // the allowed set, but missing the =/+/- operator a real clause
+        // requires. buildRevokeCapabilityScript is deliberately a shape
+        // filter, not a full parser (see its own comment), so this should
+        // reach setcap rather than being refused at 26, and setcap's own
+        // stricter parser is what actually catches it.
+        var backupPath = "/tmp/sysmonitor-test-shape-ok-grammar-bad-" + process.pid + ".bak"
+        fs.writeFileSync(backupPath, "cap_net_raw eip")
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        return r.status !== 26 && !r.ok
       })())
 check("live: a real capability string in the shape getcap actually emits passes the charset guard (setcap itself is the next and final gate)",
       (function() {
