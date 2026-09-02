@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
+import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
@@ -112,19 +113,65 @@ Panel {
   // future layout wants one combined cell instead of several).
   readonly property string label: cpuBarText + "  " + memBarText
 
+  // ── collector watchdog (same design as the full panel's — see Panel.qml
+  // for the rationale) ──
+  readonly property int collectorDeadlineMs: 8000
+  property var collectorStarts: ({})
+
+  function start(proc, name) {
+    if (proc.running) return
+    proc.running = true
+    if (name) collectorStarts[name] = Date.now()
+  }
+
+  function collectorByName(name) {
+    switch (name) {
+      case "gpuDetectProc": return gpuDetectProc
+      case "ifaceDetectProc": return ifaceDetectProc
+      case "cpuProc": return cpuProc
+      case "memProc": return memProc
+      case "diskProc": return diskProc
+      case "gpuProc": return gpuProc
+      case "sensorProc": return sensorProc
+      case "netProc": return netProc
+      case "procProc": return procProc
+      default: return null
+    }
+  }
+
+  function sweepHungCollectors() {
+    var tracked = []
+    for (var name in collectorStarts) {
+      var p = root.collectorByName(name)
+      if (!p || !p.running) { delete collectorStarts[name]; continue }
+      tracked.push({ name: name, startedAt: collectorStarts[name], deadlineMs: root.collectorDeadlineMs })
+    }
+    var overdue = Model.overdueCollectors(tracked, Date.now())
+    for (var i = 0; i < overdue.length; i++) {
+      var n = overdue[i]
+      var proc = root.collectorByName(n)
+      if (proc) {
+        var pid = proc.processId
+        if (pid) Quickshell.execDetached(["bash", "-c", Model.buildGroupKillCommand(pid)])
+        if (proc.running) proc.running = false
+      }
+      delete collectorStarts[n]
+    }
+  }
+
   function pollAll() {
-    cpuProc.running = true
-    memProc.running = true
-    diskProc.running = true
-    procProc.running = true
-    sensorProc.running = true
-    if (gpuPath !== "") gpuProc.running = true
-    if (primaryIface !== "") netProc.running = true
+    start(cpuProc, "cpuProc")
+    start(memProc, "memProc")
+    start(diskProc, "diskProc")
+    start(procProc, "procProc")
+    start(sensorProc, "sensorProc")
+    if (gpuPath !== "") start(gpuProc, "gpuProc")
+    if (primaryIface !== "") start(netProc, "netProc")
   }
 
   Component.onCompleted: {
-    gpuDetectProc.running = true
-    ifaceDetectProc.running = true
+    start(gpuDetectProc, "gpuDetectProc")
+    start(ifaceDetectProc, "ifaceDetectProc")
     pollAll()
   }
 
@@ -135,9 +182,16 @@ Panel {
     onTriggered: root.pollAll()
   }
 
+  Timer {
+    interval: 2000
+    running: true
+    repeat: true
+    onTriggered: root.sweepHungCollectors()
+  }
+
   Process {
     id: gpuDetectProc
-    command: ["bash", "-c", Model.COLLECT_GPU_PATH]
+    command: Model.wrapCollectorCommand(Model.COLLECT_GPU_PATH, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.gpuPath = String(text || "").trim()
@@ -146,7 +200,8 @@ Panel {
 
   Process {
     id: ifaceDetectProc
-    command: ["bash", "-c", "ip -o -4 route show default 2>/dev/null | awk '{print $5}' | head -1"]
+    command: Model.wrapCollectorCommand(
+      "ip -o -4 route show default 2>/dev/null | awk '{print $5}' | head -1", Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.primaryIface = String(text || "").trim()
@@ -155,7 +210,7 @@ Panel {
 
   Process {
     id: cpuProc
-    command: ["cat", "/proc/stat"]
+    command: Model.wrapCollectorCommand("cat /proc/stat", Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -173,7 +228,7 @@ Panel {
 
   Process {
     id: memProc
-    command: ["bash", "-c", "free -b"]
+    command: Model.wrapCollectorCommand("free -b", Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.memInfo = Model.parseFree(text)
@@ -182,7 +237,8 @@ Panel {
 
   Process {
     id: diskProc
-    command: ["bash", "-c", "df -h --output=source,size,used,avail,pcent,target"]
+    command: Model.wrapCollectorCommand(
+      "df -h --output=source,size,used,avail,pcent,target", Model.OUTPUT_CAP_LARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -199,7 +255,7 @@ Panel {
 
   Process {
     id: gpuProc
-    command: ["bash", "-c", Model.collectGpuDetail(root.gpuPath)]
+    command: Model.wrapCollectorCommand(Model.collectGpuDetail(root.gpuPath), Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -215,7 +271,7 @@ Panel {
 
   Process {
     id: sensorProc
-    command: ["bash", "-c", Model.COLLECT_SENSORS]
+    command: Model.wrapCollectorCommand(Model.COLLECT_SENSORS, Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -233,7 +289,7 @@ Panel {
 
   Process {
     id: netProc
-    command: ["cat", "/proc/net/dev"]
+    command: Model.wrapCollectorCommand("cat /proc/net/dev", Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -254,7 +310,7 @@ Panel {
 
   Process {
     id: procProc
-    command: ["bash", "-c", Model.COLLECT_PROC_SNAPSHOT]
+    command: Model.wrapCollectorCommand(Model.COLLECT_PROC_SNAPSHOT, Model.OUTPUT_CAP_XLARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -476,7 +532,7 @@ Panel {
       model: psec.rows
       delegate: ProcessRow {
         Layout.fillWidth: true
-        commandText: modelData.command || ""
+        commandText: Model.truncateDisplay(modelData.command, 128)
         // A Repeater's delegates are reparented to the Repeater's OWN
         // parent, not the Repeater itself, so a bare `parent` here already
         // means psec — explicit id, not a parent-chain guess, on purpose
@@ -511,6 +567,7 @@ Panel {
 
       Text {
         Layout.fillWidth: true
+        textFormat: Text.PlainText
         text: pr.commandText
         color: Color.foreground
         elide: Text.ElideRight

@@ -65,15 +65,36 @@ second door into the same panel, not a second implementation of it.
 
 ## Uninstall
 
+If either **Permissions** section below was ever enabled, revoke it from the panel first —
+each has its own **Enabled** row with a revoke button next to the Enable button it replaced.
+That runs while the plugin is still installed and reverses exactly what enabling it did (see
+Permissions for what each one actually changes and how the revoke is scoped).
+
 ```bash
 omarchy plugin remove jharrison.sysmonitor
 ```
 
-This unregisters the plugin and stops the shell from loading it. The keybinding in
-`bindings.lua` and the window rules in `hyprland.lua` from Install are just a few lines you
-added by hand — removing the plugin does not touch either file. Leaving them in place is
-harmless (the panel's window class simply never appears again), but delete them too for a
-clean config.
+This unregisters the plugin and stops the shell from loading it, but — like removing any
+Omarchy plugin — it does not run any uninstall step of its own, so it does **not** touch
+either granted permission. Revoking first, per above, is the supported path; if the plugin was
+already removed without doing that, the equivalent by hand is:
+
+```bash
+sudo setcap -r /usr/bin/bandwhich          # only if per-process network was ever enabled
+sudo rm -f /etc/sudoers.d/10-sysmonitor-smartctl \
+           /usr/local/bin/jharrison-sysmonitor-smart-helper   # only if drive health was ever enabled
+```
+
+The first line only makes sense if nothing else on the system also wants bandwhich's
+capability — `setcap -r` clears every capability on the binary, not just this plugin's grant.
+The in-panel revoke button does not have this caveat: it restores whatever capability (if any)
+was on the binary before this plugin's own grant, rather than clearing unconditionally, and it
+refuses to change anything at all if it never granted the capability in the first place.
+
+The keybinding in `bindings.lua` and the window rules in `hyprland.lua` from Install are just a
+few lines you added by hand — removing the plugin does not touch either file. Leaving them in
+place is harmless (the panel's window class simply never appears again), but delete them too
+for a clean config.
 
 ## What it shows
 
@@ -117,10 +138,19 @@ This panel computes CPU the way btop does — `utime+stime` deltas between polls
 
 ## Permissions
 
-Two sections need privileges the panel does not assume. Each renders an **Enable** button that shells out to `pkexec`, so the polkit agent raises its own password prompt and the panel never handles the credential.
+Two sections need privileges the panel does not assume. Each renders an **Enable** button that
+shells out to `pkexec`, so the polkit agent raises its own password prompt and the panel never
+handles the credential. Once granted, that button is replaced by an **Enabled** row with its
+own revoke button — see Uninstall above for what revoking actually restores.
 
-- **Per-process network** — `setcap cap_net_raw,cap_net_admin+eip` on the bandwhich binary.
-- **Drive health** — a sudoers drop-in granting exactly `smartctl -j -a /dev/nvme*n1`. It is validated with `visudo -c` before install, since a malformed drop-in can lock `sudo` out entirely. This is narrower than joining the `disk` group, which would grant raw read/write on every disk.
+Before either ever reaches `pkexec`, the target binary is checked unprivileged: resolved to its
+real path, confirmed to be a regular file owned by root inside a trusted system directory
+(`/usr/bin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`), and, where `pacman` is present,
+confirmed to be tracked by an installed package. A binary that fails any of that is never
+elevated for — there is no password prompt for a grant that was not going to happen anyway.
+
+- **Per-process network** — `setcap cap_net_raw,cap_net_admin+eip` on the bandwhich binary. Whatever capability string was already on the binary is read and saved first, so revoking restores exactly that (nothing, if there was nothing) instead of guessing. If the binary already had some other capability set by something other than this plugin, this plugin's own revoke button refuses to touch it — see Uninstall.
+- **Drive health** — a small, fixed, root-owned helper script does the enumeration and the `smartctl` call; the sudoers rule grants running that one script with **no arguments at all**. This replaced an earlier sudoers entry that granted `smartctl -j -a /dev/nvme*n1` directly — a command-line glob that has to be matched against whatever a caller actually invokes, rather than a bare command with nothing left in it to widen. `smartctl`'s own path is one of the binaries checked above; the resolved path is baked into the helper rather than the helper resolving `smartctl` off root's `PATH` at run time. Both the helper and the sudoers rule go through the same collision-safe install as everything else here: if either file already exists with different content — a leftover from a previous version of this plugin, or something else entirely — the existing file is copied aside with a timestamped `.bak` suffix before being replaced, never silently overwritten. The sudoers rule is validated with `visudo -c` before install, since a malformed drop-in can lock `sudo` out entirely. All of this is narrower than joining the `disk` group, which would grant raw read/write on every disk.
 
 bandwhich's own `<UNKNOWN>` rows are shown as *unattributed*: without root it cannot map another user's socket back to a process.
 

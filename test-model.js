@@ -150,6 +150,406 @@ else {
         M.calcNetRate({}, curr, 2).eth0 === undefined)
 }
 
+section("isValidIfaceName — the gate before an interface name reaches a privileged command")
+check("accepts ordinary interface names",
+      ["eth0", "wlan0", "enp3s0", "docker0", "wg0", "tun0", "lo", "veth1234", "br-abc123def0"]
+        .every(function(n) { return M.isValidIfaceName(n) }))
+check("accepts the maximum kernel length (15 chars, IFNAMSIZ-1)",
+      M.isValidIfaceName("123456789012345"))
+check("rejects one character over the kernel limit",
+      !M.isValidIfaceName("1234567890123456"))
+check("rejects shell metacharacters that would matter if this were ever shell-interpolated",
+      ["eth0; rm -rf /", "eth0 && whoami", "eth0`id`", "eth0$(id)", "eth0|id", "eth0\nid",
+       "eth0 ", " eth0", "e/th0", "../etc"]
+        .every(function(n) { return !M.isValidIfaceName(n) }))
+check("rejects empty, null, and non-string input",
+      !M.isValidIfaceName("") && !M.isValidIfaceName(null) && !M.isValidIfaceName(undefined))
+check("rejects a name starting with a character outside [A-Za-z0-9]",
+      !M.isValidIfaceName("-eth0") && !M.isValidIfaceName(".eth0") && !M.isValidIfaceName("_eth0"))
+check("live default-route interface name (if any) passes the validator", (function() {
+  var iface = (sh("ip -o -4 route show default 2>/dev/null | awk '{print $5}' | head -1") || "").trim()
+  if (!iface) return true // no default route on this box right now — not a validator failure
+  return M.isValidIfaceName(iface)
+})())
+
+section("truncateDisplay — the length bound before external data reaches a Text element")
+check("passes a short string through unchanged",
+      M.truncateDisplay("eth0", 64) === "eth0")
+check("passes a string exactly at the limit through unchanged",
+      M.truncateDisplay("12345", 5) === "12345")
+check("cuts a string one character over the limit and marks it with an ellipsis",
+      M.truncateDisplay("123456", 5) === "1234…" && M.truncateDisplay("123456", 5).length === 5)
+check("cuts a very long string down to the limit",
+      M.truncateDisplay("x".repeat(10000), 100).length === 100)
+check("treats null and undefined as empty, not as the literal text 'null'/'undefined'",
+      M.truncateDisplay(null, 10) === "" && M.truncateDisplay(undefined, 10) === "")
+check("coerces a non-string (number) rather than throwing",
+      M.truncateDisplay(12345, 3) === "12…")
+check("a maxLen of 0 or negative still returns a bounded (1-char) string, never throws",
+      M.truncateDisplay("hello", 0).length <= 1 && M.truncateDisplay("hello", -5).length <= 1)
+
+section("buildGuardedSignalCommand — the identity re-check immediately before a kill/renice actually runs")
+check("returns a string even for garbage input, never throws",
+      typeof M.buildGuardedSignalCommand("not-a-pid", "echo x", "u", "c", "not-a-number") === "string")
+
+// A real child process to test against: its pid, comm, and user are fully
+// known, and starting it here means its elapsed time is known too, instead
+// of guessing at a moving target.
+var guardChild = cp.spawn("sleep", ["30"], { stdio: "ignore" })
+var guardPid = guardChild.pid
+var guardUser = (sh("whoami") || "").trim()
+
+function runGuarded(actionCmd, user, comm, elapsed) {
+  var built = M.buildGuardedSignalCommand(guardPid, actionCmd, user, comm, elapsed)
+  try {
+    var out = cp.execSync(built, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+    return { ok: true, stdout: out }
+  } catch (e) {
+    return { ok: false, stdout: (e.stdout || "").toString(), stderr: (e.stderr || "").toString(), code: e.status }
+  }
+}
+
+if (!guardPid || !guardUser) {
+  skipped("buildGuardedSignalCommand live checks", "could not spawn a test child process or resolve whoami")
+} else {
+  var realEtimes = parseInt((sh("ps -o etimes= -p " + guardPid + " 2>/dev/null") || "0").trim(), 10) || 0
+
+  check("runs the action when user, comm, and elapsed all match",
+        runGuarded("echo GUARD_PASSED", guardUser, "sleep", realEtimes).stdout.indexOf("GUARD_PASSED") >= 0)
+
+  check("passes when expected elapsed is within the polling-slack tolerance of the live reading",
+        runGuarded("echo GUARD_PASSED", guardUser, "sleep", realEtimes + 2).stdout.indexOf("GUARD_PASSED") >= 0)
+
+  check("refuses when expected elapsed is far beyond tolerance of the live reading (stale/reused pid)",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sleep", realEtimes + 30)
+                      return !r.ok && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
+
+  check("refuses when the comm no longer matches (simulated pid reuse)",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "totally-different-binary", realEtimes)
+                      return !r.ok && r.code === 3 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
+
+  check("refuses when the user no longer matches",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "no-such-user", "sleep", realEtimes)
+                      return !r.ok && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
+
+  check("shell metacharacters in the expected comm cannot break out of the identity check",
+        (function() {
+          var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sleep; echo INJECTED", realEtimes)
+          return !r.ok && r.stdout.indexOf("INJECTED") < 0 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0
+        })())
+
+  check("a single quote in the expected comm produces a clean refusal, not a shell syntax error",
+        (function() {
+          var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sle'ep", realEtimes)
+          return !r.ok && r.code === 3
+        })())
+
+  guardChild.kill()
+}
+
+section("wrapCollectorCommand — process-group isolation and output cap for periodic collectors")
+check("returns a setsid-prefixed argv array shaped for Process.command",
+      (function() {
+        var cmd = M.wrapCollectorCommand("echo hi", 1000)
+        return Array.isArray(cmd) && cmd[0] === "setsid" && cmd[1] === "--"
+               && cmd[2] === "bash" && cmd[3] === "-c" && typeof cmd[4] === "string"
+      })())
+check("never throws on missing/garbage input", (function() {
+  M.wrapCollectorCommand(null, "not-a-number")
+  M.wrapCollectorCommand(undefined, undefined)
+  return true
+})())
+
+var wccArgv = M.wrapCollectorCommand("for i in $(seq 1 100000); do echo -n x; done", 500)
+var wccOut = sh(wccArgv.map(function(a) { return "'" + String(a).replace(/'/g, "'\\''") + "'" }).join(" "))
+check("live: output is truncated to the requested byte cap even though the script would emit far more",
+      wccOut !== null && wccOut.length === 500, "got " + (wccOut ? wccOut.length : "null") + " bytes")
+
+// Launches argv as a `nohup ... &` job from a throwaway shell rather than
+// via Node's own cp.spawn — deliberately. Two reasons:
+//
+// 1. Fidelity: program + args with no extra shell wrapping around the
+//    *target* command is how Quickshell's own Process type launches a
+//    command, so setsid's isolation has to come from inside the argv
+//    wrapCollectorCommand builds, not from how the harness invokes it.
+// 2. A `cp.spawn`'d child that gets killed by an external `kill` (as
+//    opposed to Node's own child.kill()) sits as a zombie until Node's
+//    event loop gets a turn to reap it — and this file's timing checks are
+//    tight synchronous busy-waits that do not reliably yield for that.
+//    A later section (Process detail) finds "the newest bash owned by this
+//    user" via pgrep, which — confirmed empirically — matches zombies too;
+//    a lingering `bash <defunct>` from here would be picked up as if it
+//    were a real shell and fail /proc/PID/exe and /proc/PID/cwd resolution
+//    for it. Backgrounding via a shell that immediately exits orphans the
+//    job to init instead, which reaps its own children promptly with zero
+//    involvement from Node — sidestepping the timing question entirely
+//    rather than racing it.
+function sq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+function launchCollectorArgv(argv) {
+  var cmdline = argv.map(sq).join(" ")
+  var pid = (sh("nohup " + cmdline + " >/dev/null 2>&1 & echo $!") || "").trim()
+  return pid ? parseInt(pid, 10) : null
+}
+
+function waitForDeath(pid, timeoutMs) {
+  var deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if ((sh("ps -o pid= -p " + pid + " 2>/dev/null") || "").trim() === "") return true
+    var spin = Date.now(); while (Date.now() - spin < 30) {}
+  }
+  return false
+}
+
+check("live: the wrapped pipeline runs in a process group distinct from this shell's own", (function() {
+  var pid = launchCollectorArgv(M.wrapCollectorCommand("sleep 2 & wait", 100))
+  if (!pid) return false
+  var spin = Date.now(); while (Date.now() - spin < 200) {}   // let setsid/exec land
+  var pgid = (sh("ps -o pgid= -p " + pid + " 2>/dev/null") || "").trim()
+  var myPgid = (sh("ps -o pgid= -p " + process.pid + " 2>/dev/null") || "").trim()
+  sh(M.buildGroupKillCommand(pid))   // clean up regardless of outcome
+  waitForDeath(pid, 1500)
+  return pgid !== "" && pgid !== myPgid
+})())
+
+section("overdueCollectors — the watchdog sweep's pure decision logic")
+check("a collector well within its deadline is not overdue",
+      M.overdueCollectors([{ name: "cpuProc", startedAt: 1000, deadlineMs: 8000 }], 2000).length === 0)
+check("a collector past its deadline is reported overdue",
+      M.overdueCollectors([{ name: "cpuProc", startedAt: 1000, deadlineMs: 8000 }], 9500)[0] === "cpuProc")
+check("exactly at the deadline counts as overdue (>=, not >)",
+      M.overdueCollectors([{ name: "x", startedAt: 0, deadlineMs: 100 }], 100).length === 1)
+check("only the overdue entries are returned out of a mixed set",
+      (function() {
+        var tracked = [{ name: "fast", startedAt: 9000, deadlineMs: 8000 },
+                       { name: "hung", startedAt: 0, deadlineMs: 8000 }]
+        var r = M.overdueCollectors(tracked, 9000)
+        return r.length === 1 && r[0] === "hung"
+      })())
+check("an empty or missing tracked list returns an empty list, never throws",
+      M.overdueCollectors([], 1000).length === 0 && M.overdueCollectors(null, 1000).length === 0)
+check("a malformed entry in the list is skipped rather than throwing",
+      M.overdueCollectors([null, { name: "ok", startedAt: 0, deadlineMs: 10 }], 100).length === 1)
+
+section("buildGroupKillCommand — the cleanup half of the watchdog")
+check("returns a safe no-op string for a non-positive pid",
+      M.buildGroupKillCommand(0) === "true" && M.buildGroupKillCommand(-5) === "true")
+check("live: tears down an entire process group from just the leader's pid", (function() {
+  // The leader (child.pid, the setsid-exec'd bash) is itself a member of
+  // the group buildGroupKillCommand computes from that same pid — so
+  // confirming the leader dies is a direct, self-contained check of "the
+  // right group got killed" with no need to separately hunt for a
+  // descendant by name (unsafe here — see spawnCollectorArgv above).
+  var pid = launchCollectorArgv(M.wrapCollectorCommand("sleep 3 & wait", 100))
+  if (!pid) return false
+  var spin = Date.now(); while (Date.now() - spin < 200) {}   // let setsid/exec land
+  var aliveBefore = (sh("ps -o pid= -p " + pid + " 2>/dev/null") || "").trim() !== ""
+  sh(M.buildGroupKillCommand(pid))
+  var reaped = waitForDeath(pid, 1500)
+  return aliveBefore && reaped
+})())
+
+section("buildExecutableValidationScript / parseExecutableValidation — provenance gate before a grant")
+check("a real, trusted, root-owned, package-tracked binary passes every check",
+      (function() {
+        var v = M.parseExecutableValidation(sh(M.buildExecutableValidationScript("/usr/bin/bash")))
+        return v.ok === true && v.reasons.length === 0 && v.realPath === "/usr/bin/bash"
+      })())
+check("the two binaries this plugin actually grants privileges to both pass",
+      (function() {
+        var smartctl = M.parseExecutableValidation(sh(M.buildExecutableValidationScript("/usr/bin/smartctl")))
+        var bandwhich = M.parseExecutableValidation(sh(M.buildExecutableValidationScript("/usr/bin/bandwhich")))
+        return smartctl.ok && bandwhich.ok
+      })())
+check("a nonexistent path fails closed with reasons given, not a silent pass",
+      (function() {
+        var v = M.parseExecutableValidation(sh(M.buildExecutableValidationScript("/tmp/sysmonitor-test-does-not-exist")))
+        return v.ok === false && v.reasons.length > 0
+      })())
+check("a real file outside trusted system directories fails on path and ownership",
+      (function() {
+        var p = "/tmp/sysmonitor-test-fake-binary"
+        fs.writeFileSync(p, "not a real binary")
+        var v = M.parseExecutableValidation(sh(M.buildExecutableValidationScript(p)))
+        fs.unlinkSync(p)
+        return !v.ok && v.reasons.indexOf("resolved path is outside trusted system directories") >= 0
+                     && v.reasons.some(function(r) { return r.indexOf("not owned by root") === 0 })
+      })())
+check("never throws on garbage input", (function() {
+  M.buildExecutableValidationScript(null)
+  M.parseExecutableValidation(null)
+  M.parseExecutableValidation(undefined)
+  return true
+})())
+
+section("buildCollisionSafeInstallScript — never a blind overwrite")
+var csiTarget = "/tmp/sysmonitor-test-csi-target-" + process.pid
+try { fs.unlinkSync(csiTarget) } catch (e) {}
+function csiBackups() {
+  return fs.readdirSync("/tmp").filter(function(f) { return f.indexOf("sysmonitor-test-csi-target-" + process.pid + ".bak") === 0 })
+}
+check("fresh install succeeds and makes no backup (nothing to back up)",
+      (function() {
+        sh(M.buildCollisionSafeInstallScript(csiTarget, "content-v1", "0644", "", "", null))
+        return fs.existsSync(csiTarget) && fs.readFileSync(csiTarget, "utf8") === "content-v1" && csiBackups().length === 0
+      })())
+check("re-installing identical content stays a no-op backup-wise",
+      (function() {
+        sh(M.buildCollisionSafeInstallScript(csiTarget, "content-v1", "0644", "", "", null))
+        return csiBackups().length === 0
+      })())
+check("installing different content backs up the old content before overwriting",
+      (function() {
+        sh(M.buildCollisionSafeInstallScript(csiTarget, "content-v2-different", "0644", "", "", null))
+        var backups = csiBackups()
+        return fs.readFileSync(csiTarget, "utf8") === "content-v2-different"
+            && backups.length === 1
+            && fs.readFileSync("/tmp/" + backups[0], "utf8") === "content-v1"
+      })())
+check("a failing validator leaves the existing target completely untouched",
+      (function() {
+        var before = fs.readFileSync(csiTarget, "utf8")
+        var backupsBefore = csiBackups().length
+        var built = M.buildCollisionSafeInstallScript(csiTarget, "not valid sudoers !!! garbage", "0644", "", "", "visudo -cf")
+        var threw = false
+        try { cp.execSync(built, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { threw = true }
+        return threw && fs.readFileSync(csiTarget, "utf8") === before && csiBackups().length === backupsBefore
+      })())
+csiBackups().forEach(function(f) { try { fs.unlinkSync("/tmp/" + f) } catch (e) {} })
+try { fs.unlinkSync(csiTarget) } catch (e) {}
+
+section("smartctl helper + sudoers rule — the narrower alternative to a command glob")
+check("the helper script is syntactically valid bash", (function() {
+  var p = "/tmp/sysmonitor-test-helper-syntax.sh"
+  fs.writeFileSync(p, M.smartHelperScript())
+  var ok = true
+  try { cp.execSync("bash -n " + p, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { ok = false }
+  fs.unlinkSync(p)
+  return ok
+})())
+check("the sudoers rule names the fixed helper path and carries no wildcard or glob character",
+      (function() {
+        var rule = M.smartSudoersRule("someuser")
+        return rule.indexOf(M.SMART_HELPER_PATH) >= 0
+            && rule.indexOf("*") < 0 && rule.indexOf("?") < 0 && rule.indexOf("nvme") < 0
+      })())
+check("the sudoers rule passes visudo -cf, the same authoritative gate the original code used",
+      (function() {
+        var p = "/tmp/sysmonitor-test-sudoers-syntax"
+        fs.writeFileSync(p, M.smartSudoersRule("someuser"))
+        var ok = true
+        try { cp.execSync("visudo -cf " + p, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { ok = false }
+        fs.unlinkSync(p)
+        return ok
+      })())
+check("the helper and sudoers paths are both fixed, non-empty, and distinct",
+      M.SMART_HELPER_PATH !== "" && M.SMART_SUDOERS_PATH !== "" && M.SMART_HELPER_PATH !== M.SMART_SUDOERS_PATH)
+check("a validated smartctl path is baked into the helper rather than left to PATH resolution",
+      (function() {
+        var withPath = M.smartHelperScript("/usr/bin/smartctl")
+        var bare = M.smartHelperScript()
+        return withPath.indexOf("'/usr/bin/smartctl' -j -a") >= 0
+            && bare.indexOf("smartctl -j -a") >= 0 && bare.indexOf("'/usr/bin/smartctl'") < 0
+      })())
+check("buildGrantSmartScript references both fixed paths and the visudo gate",
+      (function() {
+        var g = M.buildGrantSmartScript("someuser")
+        return g.indexOf(M.SMART_HELPER_PATH) >= 0 && g.indexOf(M.SMART_SUDOERS_PATH) >= 0
+            && g.indexOf("visudo -cf") >= 0
+      })())
+check("live: the helper-then-sudoers install chain actually gates — a failing first half skips the second entirely",
+      (function() {
+        var t1 = "/tmp/sysmonitor-test-chain-a-" + process.pid
+        var t2 = "/tmp/sysmonitor-test-chain-b-" + process.pid
+        try { fs.unlinkSync(t1) } catch (e) {}
+        try { fs.unlinkSync(t2) } catch (e) {}
+        var failing = M.buildCollisionSafeInstallScript(t1, "x", "0644", "", "", "false")
+        var second = M.buildCollisionSafeInstallScript(t2, "y", "0644", "", "", null)
+        var threw = false
+        try { cp.execFileSync("bash", ["-c", "(" + failing + ") && (" + second + ")"], { stdio: ["ignore", "pipe", "pipe"] }) }
+        catch (e) { threw = true }
+        var neitherExists = !fs.existsSync(t1) && !fs.existsSync(t2)
+        try { fs.unlinkSync(t1) } catch (e) {}
+        try { fs.unlinkSync(t2) } catch (e) {}
+        return threw && neitherExists
+      })())
+check("live: the same chain, both halves passing, installs both — the shape buildGrantSmartScript actually uses",
+      (function() {
+        var t1 = "/tmp/sysmonitor-test-chain-c-" + process.pid
+        var t2 = "/tmp/sysmonitor-test-chain-d-" + process.pid
+        try { fs.unlinkSync(t1) } catch (e) {}
+        try { fs.unlinkSync(t2) } catch (e) {}
+        var me = (sh("whoami") || "").trim()
+        var first = M.buildCollisionSafeInstallScript(t1, "helper content", "0755", me, me, null)
+        var second = M.buildCollisionSafeInstallScript(t2, "sudoers content", "0644", me, me, null)
+        cp.execFileSync("bash", ["-c", "(" + first + ") && (" + second + ")"], { stdio: ["ignore", "pipe", "pipe"] })
+        var ok = fs.existsSync(t1) && fs.readFileSync(t1, "utf8") === "helper content"
+              && fs.existsSync(t2) && fs.readFileSync(t2, "utf8") === "sudoers content"
+        try { fs.unlinkSync(t1) } catch (e) {}
+        try { fs.unlinkSync(t2) } catch (e) {}
+        return ok
+      })())
+check("buildRevokeSmartScript removes exactly the sudoers rule and the helper, nothing else",
+      (function() {
+        var r = M.buildRevokeSmartScript()
+        return r.indexOf(M.SMART_SUDOERS_PATH) >= 0 && r.indexOf(M.SMART_HELPER_PATH) >= 0
+            && r.indexOf("rm -rf") < 0   // never a recursive/broad remove for a two-file cleanup
+      })())
+
+section("buildGrantCapabilityScript / buildRevokeCapabilityScript — bandwhich's capability, with a backup path")
+check("both scripts are syntactically valid bash", (function() {
+  var p = "/tmp/sysmonitor-test-cap-syntax.sh"
+  var ok1, ok2
+  fs.writeFileSync(p, M.buildGrantCapabilityScript("/usr/bin/bandwhich", "cap_net_raw+eip", "/tmp/x.bak"))
+  try { cp.execSync("bash -n " + p, { stdio: ["ignore", "pipe", "pipe"] }); ok1 = true } catch (e) { ok1 = false }
+  fs.writeFileSync(p, M.buildRevokeCapabilityScript("/usr/bin/bandwhich", "/tmp/x.bak"))
+  try { cp.execSync("bash -n " + p, { stdio: ["ignore", "pipe", "pipe"] }); ok2 = true } catch (e) { ok2 = false }
+  fs.unlinkSync(p)
+  return ok1 && ok2
+})())
+// execSync("bash -c " + JSON.stringify(script)) re-parses the whole thing
+// through execSync's OWN default shell before bash ever sees it — the
+// outer shell's own $-expansion and quote handling mangles a script this
+// size before it reaches the inner bash -c. execFileSync with an argv
+// array hands `script` to bash as one literal argument, no outer shell
+// involved, which is what every check below actually needs.
+function runScript(script) {
+  try { return { ok: true, out: cp.execFileSync("bash", ["-c", script], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) } }
+  catch (e) { return { ok: false, status: e.status, stderr: (e.stderr || "").toString() } }
+}
+
+check("the grant script's own path guard rejects a target outside trusted directories before any privileged action",
+      (function() {
+        var built = M.buildGrantCapabilityScript("/tmp/sysmonitor-test-not-a-real-target", "cap_net_raw+eip", "/tmp/sysmonitor-test-x.bak")
+        var r = runScript(built)
+        return !r.ok && r.status === 20   // our own guard, not a setcap/permission failure downstream
+      })())
+check("revoke refuses (exit 23) when no backup file exists, rather than stripping a capability this plugin never granted",
+      (function() {
+        var backupPath = "/tmp/sysmonitor-test-no-such-backup-" + process.pid + ".bak"
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        return !r.ok && r.status === 23
+      })())
+check("revoke proceeds when a backup file exists (still fails past that on the real setcap without root, but past our own guard)",
+      (function() {
+        var backupPath = "/tmp/sysmonitor-test-has-backup-" + process.pid + ".bak"
+        fs.writeFileSync(backupPath, "")   // "" is a legitimate backup: there was nothing before our grant
+        var r = runScript(M.buildRevokeCapabilityScript("/usr/bin/bash", backupPath))
+        // A successful pass through the backup-exists guard removes the
+        // backup file itself (see buildRevokeCapabilityScript's `rm -f`) —
+        // whether that happened or not, don't fail cleanup over it.
+        try { fs.unlinkSync(backupPath) } catch (e) {}
+        // Unprivileged setcap on a real system binary fails with its own
+        // exit code — the point of this check is only that it is NOT 23
+        // (our own refusal), i.e. the backup-exists guard let it through.
+        return r.status !== 23
+      })())
+check("never throws on garbage input", (function() {
+  M.buildGrantCapabilityScript(null, null, null)
+  M.buildRevokeCapabilityScript(undefined, undefined)
+  return true
+})())
+
 section("bandwhich — real raw format")
 var bwCaps = sh('getcap "$(command -v bandwhich)" 2>/dev/null') || ""
 if (bwCaps.indexOf("cap_net_raw") < 0) skipped("live bandwhich capture", "binary has no cap_net_raw")
@@ -346,6 +746,17 @@ check("mergeProcRows filter bypasses the row limit so a low-usage match still su
         var filtered = M.mergeProcRows(rows, null, "cpu", 3, "stuck")
         return unfiltered.every(function(r) { return r.pid !== 4 })   // hidden without a filter
             && filtered.length === 1 && filtered[0].pid === 4          // found with one
+      })())
+check("mergeProcRows filter still enforces a safety ceiling on a pathological match count",
+      (function() {
+        var rows = []
+        for (var i = 1; i <= 900; i++)
+          rows.push({ pid: i, cpu: 0, cpuCore: 0, rss: 0, command: "matchme" + i, fullCommand: "matchme" + i })
+        var filtered = M.mergeProcRows(rows, null, "cpu", 8, "matchme")
+        // Well above any real process count (so a genuine search is never
+        // trimmed), but not infinite — 900 real matches must still come
+        // back capped, not all 900.
+        return filtered.length === 500
       })())
 check("mergeProcRows filter with no match returns an empty list, not the unfiltered set",
       (function() {

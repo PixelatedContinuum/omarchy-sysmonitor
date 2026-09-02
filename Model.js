@@ -457,6 +457,38 @@ function parsePsLine(line) {
   }
 }
 
+// Strict allow-list for a network interface name before it can be used to
+// build a privileged command (bandwhich runs under a granted capability).
+// The kernel's own dev_valid_name() (net/core/dev.c) already rejects '/',
+// whitespace, and names >= IFNAMSIZ (16, so 15 usable chars) at interface
+// creation time — but relying on an upstream data source's assumed-safe
+// character set is exactly the kind of thing that stops being true the
+// moment any part of the chain (ip route's output shape, an unusual virtual
+// interface, a parsing edge case) changes. An allow-list checked at the one
+// point this name is about to be used to build a command is cheap and does
+// not depend on any of that continuing to hold.
+function isValidIfaceName(name) {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,14}$/.test(String(name || ""))
+}
+
+// Bounds a string before it reaches a Text element, for every value on this
+// panel that ultimately comes from outside the plugin — a process name, a
+// mount path, a device or sensor label, subprocess stderr. None of those
+// sources is under this plugin's control, so none of them gets to grow a UI
+// element without a limit just because a real system has not (yet) produced
+// one that long. Cutting the STRING here, not just eliding it visually,
+// matters: an elided Text still holds the full value in memory and in
+// anything downstream (a tooltip, a copy, a future binding) that reads the
+// same property — this is the one place the length actually stops.
+//
+// maxLen is required, not defaulted — every call site names the bound it
+// chose for that field, which is easier to review than one hidden global.
+function truncateDisplay(str, maxLen) {
+  var s = String(str === undefined || str === null ? "" : str)
+  var n = maxLen > 0 ? maxLen : 1
+  return s.length > n ? s.slice(0, Math.max(0, n - 1)) + "…" : s
+}
+
 // Does a `ps` USER field refer to the given account?
 //
 // Plain `ps -eo user` truncates to 8 characters and appends `+`
@@ -471,6 +503,301 @@ function userMatches(psUser, currentUser) {
   if (a === b) return true
   if (a.charAt(a.length - 1) === "+") return b.indexOf(a.slice(0, -1)) === 0
   return false
+}
+
+// Builds a single shell command that re-reads a pid's current owner, comm,
+// and elapsed time and only runs `actionCmd` if all three still match what
+// was on screen when the user acted. The process list is a snapshot up to
+// pollInterval old, and choosing a row, then pressing a key or confirming a
+// force-kill, adds real human time on top of that. If the original process
+// exited in that window the kernel is free to hand its pid to something
+// else entirely, and a signal sent on pid alone would land on whatever that
+// is — not what the user selected. Elapsed time only ever grows for a
+// process that kept running, so a fresh reading that comes back lower than
+// expected is itself evidence of reuse, not measurement noise; a small
+// tolerance absorbs polling/extrapolation rounding without opening the
+// window back up. Reading and acting happen inside one `ps` + one shell
+// process, so there is no second gap between the check and the act for a
+// reuse to land in.
+//
+// actionCmd must not itself depend on anything other than the pid/signal/
+// nice-value literals the caller already embedded in it (e.g. "kill -TERM
+// 1234") — this only wraps a guard around it, it does not sanitize it.
+function buildGuardedSignalCommand(pid, actionCmd, expectedUser, expectedComm, expectedElapsed) {
+  var p = _int(pid)
+  var user = String(expectedUser || "")
+  var comm = String(expectedComm || "")
+  var elapsed = _num(expectedElapsed)
+  var tolerance = 3 // seconds of slack for polling/extrapolation rounding
+  var floor = Math.max(0, Math.floor(elapsed - tolerance))
+  // Single-quote for POSIX sh; a literal single quote inside a value (rare
+  // in a username or comm, but comm can hold nearly anything) is escaped by
+  // closing the quote, emitting an escaped quote, and reopening it.
+  var sq = function(s) { return "'" + s.replace(/'/g, "'\\''") + "'" }
+  return "u=$(ps -o user:20= -p " + p + " 2>/dev/null | tr -d ' '); " +
+         "c=$(ps -o comm= -p " + p + " 2>/dev/null); " +
+         "e=$(ps -o etimes= -p " + p + " 2>/dev/null | tr -d ' '); " +
+         "if [ \"$u\" = " + sq(user) + " ] && [ \"$c\" = " + sq(comm) + " ] " +
+         "&& [ -n \"$e\" ] && [ \"$e\" -ge " + floor + " ]; then " +
+         actionCmd + "; " +
+         "else echo " + sq("REFUSED: pid " + p + " no longer matches the selected process") + " >&2; exit 3; fi"
+}
+
+// ------------------------------------------------- collector process safety
+//
+// Every periodic collector is a short read-only shell one-liner over /proc
+// and /sys that should complete in well under a second — but nothing stops
+// a corrupted sysfs value, an unusual device node, or a blocked read from
+// turning one of them into a subprocess that never exits. The three
+// functions below back the three things that need to be true regardless:
+// output cannot grow without bound, a hang cannot run forever, and killing
+// a hung collector cannot leave any of its own children behind as orphans.
+
+// Output-cap tiers for wrapCollectorCommand, named rather than passed as
+// bare numbers at each of the ~15 call sites: TINY for a handful of fixed
+// short lines (load average, a probe result, a device list), MEDIUM for
+// readings that scale with hardware (cores, sensors, interfaces) but stay
+// bounded by what one machine actually has, LARGE for readings that scale
+// with mounted filesystems or JSON-formatted drive health, and XLARGE only
+// for the process snapshot, the one collector whose output genuinely scales
+// with how busy the machine is (hundreds of processes on a loaded system).
+var OUTPUT_CAP_TINY = 8192
+var OUTPUT_CAP_MEDIUM = 65536
+var OUTPUT_CAP_LARGE = 262144
+var OUTPUT_CAP_XLARGE = 1048576
+
+// Wraps a collector script as a full argv command: run under `setsid` so
+// the whole pipeline (every stage — awk, cat, ps, whatever the script
+// forks) lands in ONE process group distinct from the plugin's own, and
+// piped through `head -c` so total output is bounded no matter how much a
+// pathological /proc/sysfs read would otherwise produce. The subshell
+// `( ... )` wrapper makes piping safe regardless of the script's own
+// internal structure (loops, conditionals, multiple statements) — POSIX
+// guarantees a subshell's combined stdout is one pipeable stream.
+//
+// Verified empirically (not just by reading setsid's manual): a plain
+// pipeline launched this way puts every stage in a process group distinct
+// from the launching shell's own, confirmed with `ps -o pgid=` before and
+// after — see buildGroupKillCommand for how that group is torn down.
+function wrapCollectorCommand(script, maxOutputBytes) {
+  var n = maxOutputBytes > 0 ? _int(maxOutputBytes) : 65536
+  return ["setsid", "--", "bash", "-c", "( " + String(script || "true") + " ) | head -c " + n]
+}
+
+// Given the tracked {name, startedAt, deadlineMs} for every collector
+// currently believed to be running and the current time, returns the names
+// of any that have run past their deadline. Pure decision logic — actually
+// killing a process is a QML-side effect (Process.signal / execDetached),
+// this only decides which ones qualify.
+function overdueCollectors(tracked, nowMs) {
+  var now = _num(nowMs)
+  return (tracked || [])
+    .filter(function(t) { return t && now - _num(t.startedAt) >= _num(t.deadlineMs) })
+    .map(function(t) { return t.name })
+}
+
+// Builds a fire-and-forget shell command that looks up pid's CURRENT
+// process group and kills the whole group, not just pid itself. A hung
+// collector launched via wrapCollectorCommand is the group LEADER (setsid
+// guarantees that), so this reaches every pipeline stage it forked, even
+// ones that would otherwise be reparented to init and keep running after
+// the leader alone was killed. Re-reads the pgid fresh rather than
+// assuming it equals pid — correct regardless of exactly how setsid's own
+// fork/exec played out for a given process.
+function buildGroupKillCommand(pid) {
+  var p = _int(pid)
+  if (p <= 0) return "true"
+  return "pgid=$(ps -o pgid= -p " + p + " 2>/dev/null | tr -d ' '); " +
+         "[ -n \"$pgid\" ] && kill -KILL -- \"-$pgid\" 2>/dev/null; true"
+}
+
+// ------------------------------------------------- privilege-grant safety
+//
+// Two sections (bandwhich's capability, smartctl's sudoers rule) ask for a
+// persistent privilege the panel does not itself hold. All of it runs
+// through the functions below, for four reasons a marketplace reviewer
+// named directly: what we are about to grant a privilege TO needs checking
+// before we grant it (provenance), a grant that already exists needs
+// noticing rather than silently overwriting (collision), what was there
+// before needs saving so a revoke can restore it rather than guessing at a
+// bare "off" state (backup), and there needs to be an actual "off" a user
+// can reach without uninstalling the whole plugin (rollback).
+
+// Unprivileged — no pkexec needed to answer "is this the binary we think it
+// is". Emits one KEY=value line per fact so parseExecutableValidation can
+// name exactly which check failed rather than a single opaque yes/no.
+// Deliberately run and checked BEFORE ever prompting for a password: if
+// this already fails, elevating would just ask for credentials to do
+// something we are not going to do anyway.
+function buildExecutableValidationScript(path) {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  var p = sq(String(path || ""))
+  return "real=$(readlink -f -- " + p + " 2>/dev/null); echo \"REAL=$real\"; " +
+    "case \"$real\" in " +
+    "  /usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*) echo 'PATHOK=1' ;; " +
+    "  *) echo 'PATHOK=0' ;; " +
+    "esac; " +
+    "if [ -n \"$real\" ] && [ -f \"$real\" ] && [ ! -L \"$real\" ]; then echo 'TYPEOK=1'; else echo 'TYPEOK=0'; fi; " +
+    "owner=$(stat -c '%U' -- \"$real\" 2>/dev/null); echo \"OWNER=${owner:-unknown}\"; " +
+    "if command -v pacman >/dev/null 2>&1; then " +
+    "  if [ -n \"$real\" ] && pacman -Qo -- \"$real\" >/dev/null 2>&1; then echo 'PKGOK=1'; else echo 'PKGOK=0'; fi; " +
+    "else echo 'PKGOK=SKIP'; fi"
+}
+
+// Pure parser for the script above — the actual pass/fail decision, kept
+// separate from the shell text so it is testable without a subprocess.
+// PKGOK=SKIP (no pacman on this system) does not fail validation on its
+// own; every other check does.
+function parseExecutableValidation(output) {
+  var lines = String(output || "").split("\n")
+  var kv = {}
+  for (var i = 0; i < lines.length; i++) {
+    var eq = lines[i].indexOf("=")
+    if (eq > 0) kv[lines[i].substring(0, eq)] = lines[i].substring(eq + 1)
+  }
+  var reasons = []
+  if (!kv.REAL) reasons.push("could not resolve a real path")
+  if (kv.PATHOK !== "1") reasons.push("resolved path is outside trusted system directories")
+  if (kv.TYPEOK !== "1") reasons.push("not a regular file")
+  if (kv.OWNER !== "root") reasons.push("not owned by root (owner: " + (kv.OWNER || "unknown") + ")")
+  if (kv.PKGOK === "0") reasons.push("not tracked by any installed package")
+  return { ok: reasons.length === 0, realPath: kv.REAL || "", reasons: reasons }
+}
+
+// The privileged half of granting bandwhich's capability: re-resolves the
+// path (never trusts the unprivileged validation pass alone — this is the
+// invocation that actually matters), records whatever capability string
+// was already set before overwriting it (so revokeBandwhich can restore
+// exactly that instead of guessing "probably nothing"), then applies the
+// new one. backupPath lives under the plugin's own directory, not /etc —
+// this plugin is a per-user install and the backup is per-user state, not
+// system configuration.
+function buildGrantCapabilityScript(path, capString, backupPath) {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
+    "case \"$real\" in /usr/bin/*|/usr/sbin/*|/usr/local/bin/*|/usr/local/sbin/*) : ;; *) exit 20 ;; esac; " +
+    "[ -f \"$real\" ] && [ ! -L \"$real\" ] || exit 21; " +
+    "[ \"$(stat -c '%U' -- \"$real\")\" = root ] || exit 22; " +
+    "old=$(getcap -- \"$real\" 2>/dev/null || true); " +
+    "mkdir -p -- " + sq(String(backupPath || "").replace(/\/[^/]*$/, "")) + "; " +
+    "printf '%s' \"$old\" > " + sq(String(backupPath || "")) + "; " +
+    "setcap " + sq(String(capString || "")) + " -- \"$real\""
+}
+
+// Restores whatever capability string buildGrantCapabilityScript backed
+// up — a full "off" (no capability at all) only when there is no backup to
+// restore, e.g. a fresh grant that had nothing before it. Reading the
+// backup and clearing it happen in the same script as the restore so a
+// revoke cannot partially apply and then be re-run against a backup file
+// that no longer describes the true prior state.
+// Refuses to touch the capability at all when no backup file exists (exit
+// 23) rather than defaulting to "strip everything". A missing backup means
+// this plugin never actually recorded a grant at this path — most likely
+// because the capability predates this plugin (bandwhich's own docs
+// recommend the exact same setcap line as a manual install step) — and
+// stripping a capability this plugin never granted, with no record to
+// restore it from, is exactly the kind of silent, unrecoverable action
+// backup/rollback exists to prevent. Only a real backup file (even one
+// holding an empty string, meaning "there was genuinely nothing before
+// this plugin's own grant") authorizes a change here.
+function buildRevokeCapabilityScript(path, backupPath) {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  var bp = sq(String(backupPath || ""))
+  return "real=$(readlink -f -- " + sq(String(path || "")) + "); " +
+    "[ -n \"$real\" ] || exit 20; " +
+    "[ -f " + bp + " ] || exit 23; " +
+    "old=$(cat " + bp + " 2>/dev/null || true); " +
+    "if [ -n \"$old\" ]; then setcap \"$old\" -- \"$real\"; else setcap -r -- \"$real\" 2>/dev/null || true; fi; " +
+    "rm -f " + bp
+}
+
+// Installs `content` at targetPath, but never as a blind overwrite:
+// pre-existing content that DIFFERS from what we are about to write is
+// copied aside with a timestamped .bak suffix first, so a file that was
+// already there — from a previous version of this plugin, or coincidence —
+// is not silently lost with no way back. Re-running with identical
+// content is a no-op backup-wise (there is nothing to lose). validateCmd,
+// when given, must pass against the staged temp file before install is
+// even attempted — a validation failure leaves the existing target
+// completely untouched. Verified by hand against all three outcomes
+// (fresh install, differing-content collision, failing validation) before
+// being encoded here — see the session's own scratch verification.
+function buildCollisionSafeInstallScript(targetPath, content, mode, owner, group, validateCmd) {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  var tp = sq(String(targetPath || ""))
+  var m = String(mode || "0644")
+  var o = String(owner || "root")
+  var g = String(group || "root")
+  var validate = validateCmd ? (validateCmd + " \"$t\" && ") : ""
+  return "t=$(mktemp) && printf '%s' " + sq(String(content || "")) + " > \"$t\" && chmod " + m + " \"$t\" && " +
+    validate +
+    "{ [ -e " + tp + " ] && ! cmp -s \"$t\" " + tp + " && cp -p " + tp + " " + tp + ".bak-$(date +%s) 2>/dev/null; true; } && " +
+    "install -m " + m + " -o " + o + " -g " + g + " \"$t\" " + tp + "; " +
+    "rc=$?; rm -f \"$t\"; exit $rc"
+}
+
+// Fixed install locations for the smartctl helper — a root-owned script
+// the sudoers rule below grants with NO arguments at all, in place of a
+// sudoers command glob (`smartctl -j -a /dev/nvme*n1`) that has to be
+// matched against whatever the caller actually typed. Nothing about
+// SMART_HELPER_PATH is user-influenced, so there is nothing here for a
+// caller to widen.
+var SMART_HELPER_PATH = "/usr/local/bin/jharrison-sysmonitor-smart-helper"
+var SMART_SUDOERS_PATH = "/etc/sudoers.d/10-sysmonitor-smartctl"
+
+// The helper itself does the device enumeration that used to live in the
+// sudoers glob — in trusted, root-owned code instead of in a permission
+// grant. `set -euo pipefail` means a device that fails partway (a drive
+// that dropped out mid-query) stops that one iteration cleanly rather than
+// printing a truncated JSON blob the parser would choke on.
+// smartctlPath should be the already-validated realPath from
+// parseExecutableValidation — baked in at generation time rather than the
+// helper resolving a bare `smartctl` off root's PATH at run time, so the
+// same provenance check this plugin applies before granting bandwhich's
+// capability also decides which binary the sudoers grant can ever reach.
+// Falls back to the bare command only if no validated path was supplied,
+// which callers should treat as "validation was skipped", not "safe".
+function smartHelperScript(smartctlPath) {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  var bin = smartctlPath ? sq(String(smartctlPath)) : "smartctl"
+  return "#!/bin/bash\n" +
+    "# Installed by the jharrison.sysmonitor Omarchy plugin. Root-owned,\n" +
+    "# not writable by the invoking user. Takes no arguments — the\n" +
+    "# sudoers rule permitting this grants exactly this bare command,\n" +
+    "# nothing left to parameterize. Device enumeration happens here, in\n" +
+    "# trusted code, instead of being encoded in the grant itself.\n" +
+    "set -euo pipefail\n" +
+    "for d in /dev/nvme*n1; do\n" +
+    "  [ -e \"$d\" ] || continue\n" +
+    "  echo \"@@$d\"\n" +
+    "  " + bin + " -j -a \"$d\" 2>/dev/null || true\n" +
+    "done\n"
+}
+
+function smartSudoersRule(username) {
+  return String(username || "") + " ALL=(root) NOPASSWD: " + SMART_HELPER_PATH + "\n"
+}
+
+// Full grant script: install the helper (0755, root:root) then the
+// sudoers rule that names it (0440, root:root, visudo-validated) — both
+// through buildCollisionSafeInstallScript, so an unexpected pre-existing
+// file at either path is backed up rather than clobbered, and a helper
+// that fails to install correctly never leaves a sudoers rule pointing at
+// a script that is not what this plugin actually shipped.
+function buildGrantSmartScript(username, smartctlPath) {
+  var helper = buildCollisionSafeInstallScript(SMART_HELPER_PATH, smartHelperScript(smartctlPath), "0755", "root", "root", null)
+  var sudoers = buildCollisionSafeInstallScript(SMART_SUDOERS_PATH, smartSudoersRule(username), "0440", "root", "root", "visudo -cf")
+  return "(" + helper + ") && (" + sudoers + ")"
+}
+
+// Reverses buildGrantSmartScript — removes both the sudoers rule and the
+// helper it names. Backups made along the way (the .bak-* files) are left
+// in place deliberately: they are evidence of what was there before this
+// plugin touched the system, and deleting them on revoke would be exactly
+// the kind of silent data loss backup/rollback exists to prevent.
+function buildRevokeSmartScript() {
+  var sq = function(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
+  return "rm -f -- " + sq(SMART_SUDOERS_PATH) + " " + sq(SMART_HELPER_PATH)
 }
 
 function parsePsOutput(raw) {
@@ -638,6 +965,8 @@ function cpuSortValue(r) {
 // place, and the process worth searching for is usually the one with nothing
 // to earn it a place in the plain top-N view (a window that stopped
 // responding is idle, not busy).
+var FILTER_RESULT_CAP = 500
+
 function mergeProcRows(rows, cpuByPid, sortBy, limit, filterText) {
   var out = []
   for (var i = 0; i < (rows || []).length; i++) {
@@ -660,10 +989,17 @@ function mergeProcRows(rows, cpuByPid, sortBy, limit, filterText) {
 
   var needle = String(filterText || "").trim().toLowerCase()
   if (needle) {
-    return out.filter(function(r) {
+    var matches = out.filter(function(r) {
       var hay = (String(r.command || "") + " " + String(r.fullCommand || "")).toLowerCase()
       return hay.indexOf(needle) >= 0 || String(r.pid).indexOf(needle) >= 0
     })
+    // Deliberately not `limit` here — see above, that would defeat the point
+    // of search. FILTER_RESULT_CAP is a much larger safety ceiling instead:
+    // a real desktop's process count is in the hundreds, so this never
+    // trims a genuine search, but a Repeater model still cannot grow
+    // without bound if something pathological (a fork bomb, an unusual
+    // namespace) puts thousands of matching rows on the table at once.
+    return matches.slice(0, FILTER_RESULT_CAP)
   }
 
   var n = limit > 0 ? limit : out.length
@@ -1056,6 +1392,27 @@ if (typeof module !== "undefined" && module.exports) {
     parsePsLine: parsePsLine,
     parsePsOutput: parsePsOutput,
     userMatches: userMatches,
+    buildGuardedSignalCommand: buildGuardedSignalCommand,
+    wrapCollectorCommand: wrapCollectorCommand,
+    OUTPUT_CAP_TINY: OUTPUT_CAP_TINY,
+    OUTPUT_CAP_MEDIUM: OUTPUT_CAP_MEDIUM,
+    OUTPUT_CAP_LARGE: OUTPUT_CAP_LARGE,
+    OUTPUT_CAP_XLARGE: OUTPUT_CAP_XLARGE,
+    overdueCollectors: overdueCollectors,
+    buildGroupKillCommand: buildGroupKillCommand,
+    buildExecutableValidationScript: buildExecutableValidationScript,
+    parseExecutableValidation: parseExecutableValidation,
+    buildGrantCapabilityScript: buildGrantCapabilityScript,
+    buildRevokeCapabilityScript: buildRevokeCapabilityScript,
+    buildCollisionSafeInstallScript: buildCollisionSafeInstallScript,
+    SMART_HELPER_PATH: SMART_HELPER_PATH,
+    SMART_SUDOERS_PATH: SMART_SUDOERS_PATH,
+    smartHelperScript: smartHelperScript,
+    smartSudoersRule: smartSudoersRule,
+    buildGrantSmartScript: buildGrantSmartScript,
+    buildRevokeSmartScript: buildRevokeSmartScript,
+    isValidIfaceName: isValidIfaceName,
+    truncateDisplay: truncateDisplay,
     formatState: formatState,
     parseSmartHealth: parseSmartHealth,
     parseDfOutput: parseDfOutput,

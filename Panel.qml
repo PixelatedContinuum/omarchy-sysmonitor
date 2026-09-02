@@ -334,22 +334,52 @@ Item {
     return proc ? Model.userMatches(proc.user, root.currentUser) : false
   }
 
+  // Estimated CURRENT elapsed time for a process row last refreshed by a
+  // poll — used only to build the tolerance window in killProcess /
+  // reniceProcess below, never displayed. Extrapolates from the row's own
+  // elapsed (as of the poll that produced it) plus wall-clock time since
+  // that poll, so the real seconds a user spends looking at a row before
+  // pressing a key are not themselves mistaken for pid reuse.
+  function expectedElapsedFor(procRow) {
+    if (!procRow || procRow.elapsed === undefined) return -1
+    var sincePoll = root.procTicksAt > 0 ? (Date.now() - root.procTicksAt) / 1000 : 0
+    return procRow.elapsed + Math.max(0, sincePoll)
+  }
+
   // Signals go through a Process rather than execDetached so a refusal is
   // visible: killing another user's process fails with EPERM, and the row
   // merely not disappearing reads as a broken button.
-  function killProcess(pid, signal) {
+  //
+  // procRow is the row this action was chosen against — the dispatched
+  // command re-reads the pid's CURRENT owner, comm, and elapsed time fresh
+  // and only signals if all three still match. Between a poll populating
+  // the list and the user actually pressing a key (or confirming a force
+  // kill), the original process can have exited and the kernel can have
+  // handed its pid to something unrelated; without this, the signal would
+  // go to whatever that is rather than what the user selected. See
+  // Model.buildGuardedSignalCommand for how the check and the act are kept
+  // atomic. A missing/null procRow still builds a command (an expected
+  // comm/user of "" and elapsed of -1 can never match a real process), so
+  // the fallback direction is "refuse", never "skip the check".
+  function killProcess(pid, signal, procRow) {
     if (pid <= 0) return
     actionError = ""
     actionProc.pendingLabel = "kill -" + signal + " " + pid
-    actionProc.command = ["kill", "-" + signal, String(pid)]
+    actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
+      pid, "kill -" + signal + " " + String(pid),
+      procRow ? procRow.user : "", procRow ? procRow.command : "",
+      root.expectedElapsedFor(procRow))]
     actionProc.running = true
   }
 
-  function reniceProcess(pid, nice) {
+  function reniceProcess(pid, nice, procRow) {
     if (pid <= 0) return
     actionError = ""
     actionProc.pendingLabel = "renice " + nice + " " + pid
-    actionProc.command = ["renice", "-n", String(nice), "-p", String(pid)]
+    actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
+      pid, "renice -n " + nice + " -p " + String(pid),
+      procRow ? procRow.user : "", procRow ? procRow.command : "",
+      root.expectedElapsedFor(procRow))]
     actionProc.running = true
   }
 
@@ -360,6 +390,18 @@ Item {
 
   property string grantBusy: ""
   property string grantError: ""
+  // "grant" or "revoke" — which action grantProc is currently mid-flight
+  // for, so its one shared onExited handler can word a generic failure
+  // correctly instead of always saying "grant failed" on what might be a
+  // revoke.
+  property string grantAction: ""
+
+  // Per-user state, not plugin config: where a capability backup lives so
+  // revokeBandwhich can restore exactly what was there before this plugin
+  // touched it, rather than guessing "probably nothing". Deliberately
+  // outside the plugin's own (git-tracked) install directory.
+  readonly property string grantStateDir: (Quickshell.env("HOME") || "") + "/.local/state/jharrison-sysmonitor"
+  readonly property string bandwhichCapBackupPath: grantStateDir + "/bandwhich-cap.bak"
 
   // Privilege grants run through pkexec, so the polkit agent raises its own
   // password dialog and this panel never sees the credential. Nothing is
@@ -369,25 +411,63 @@ Item {
   // open a root-owned block device; a narrow sudoers entry allows exactly the
   // SMART read without putting the account in the `disk` group, which would
   // grant raw read/write to every disk rather than one command.
+  //
+  // Both run through grantValidateProc FIRST, unprivileged — resolving the
+  // real path, confirming it is root-owned, a regular file, inside a
+  // trusted system directory, and (where pacman is available) tracked by an
+  // installed package — before ever prompting for a password. A grant that
+  // was going to fail this check would otherwise still ask for credentials
+  // to do something it was never going to do.
   function grantBandwhich() {
-    grantBusy = "bandwhich"; grantError = ""
-    grantProc.command = ["pkexec", "setcap",
-                         "cap_net_raw,cap_net_admin+eip", "/usr/bin/bandwhich"]
-    grantProc.running = true
+    grantBusy = "bandwhich"; grantError = ""; grantAction = "grant"
+    grantValidateProc.pendingTarget = "bandwhich"
+    grantValidateProc.command = ["bash", "-c", Model.buildExecutableValidationScript("/usr/bin/bandwhich")]
+    grantValidateProc.running = true
   }
 
   function grantSmart() {
-    grantBusy = "smartctl"; grantError = ""
-    var rule = (Quickshell.env("USER") || "")
-             + " ALL=(root) NOPASSWD: /usr/bin/smartctl -j -a /dev/nvme*n1\n"
-    // Written to a temp file and validated with `visudo -c` before it is put
-    // in place: a malformed sudoers drop-in can lock sudo out entirely.
-    grantProc.command = ["pkexec", "sh", "-c",
-      "t=$(mktemp) && printf '%s' " + Util.shellQuote(rule) + " > \"$t\""
-      + " && chmod 0440 \"$t\""
-      + " && visudo -cf \"$t\""
-      + " && install -m 0440 -o root -g root \"$t\" /etc/sudoers.d/10-sysmonitor-smartctl"
-      + "; rc=$?; rm -f \"$t\"; exit $rc"]
+    grantBusy = "smartctl"; grantError = ""; grantAction = "grant"
+    grantValidateProc.pendingTarget = "smartctl"
+    grantValidateProc.command = ["bash", "-c", Model.buildExecutableValidationScript("/usr/bin/smartctl")]
+    grantValidateProc.running = true
+  }
+
+  // The privileged half of each grant, dispatched once grantValidateProc's
+  // onStreamFinished below confirms the target passed validation.
+  function proceedGrantBandwhich(realPath) {
+    grantAction = "grant"
+    grantProc.pendingLabel = "granting per-process network"
+    grantProc.command = ["pkexec", "bash", "-c", Model.buildGrantCapabilityScript(
+      realPath, "cap_net_raw,cap_net_admin+eip", root.bandwhichCapBackupPath)]
+    grantProc.running = true
+  }
+
+  function proceedGrantSmart(realPath) {
+    grantAction = "grant"
+    grantProc.pendingLabel = "granting drive health access"
+    grantProc.command = ["pkexec", "bash", "-c",
+      Model.buildGrantSmartScript(Quickshell.env("USER") || "", realPath)]
+    grantProc.running = true
+  }
+
+  // The in-panel undo — a way back to "not granted" without uninstalling
+  // the whole plugin, which `omarchy plugin remove` does not do on its own
+  // (see README → Uninstall). No re-validation before revoke: reducing a
+  // privilege is not the action Point 7 is about, and the scripts
+  // themselves re-resolve the real path fresh rather than trusting a
+  // stale one.
+  function revokeBandwhich() {
+    grantBusy = "bandwhich"; grantError = ""; grantAction = "revoke"
+    grantProc.pendingLabel = "revoking per-process network"
+    grantProc.command = ["pkexec", "bash", "-c",
+      Model.buildRevokeCapabilityScript("/usr/bin/bandwhich", root.bandwhichCapBackupPath)]
+    grantProc.running = true
+  }
+
+  function revokeSmart() {
+    grantBusy = "smartctl"; grantError = ""; grantAction = "revoke"
+    grantProc.pendingLabel = "revoking drive health access"
+    grantProc.command = ["pkexec", "bash", "-c", Model.buildRevokeSmartScript()]
     grantProc.running = true
   }
 
@@ -445,7 +525,7 @@ Item {
   onProcessSortByChanged: {
     if (processData.length > 0)
       processData = Model.mergeProcRows(processData, null, processSortBy, processCount)
-    start(procProc)
+    start(procProc, "procProc")
   }
 
   // Same instant-then-confirmed shape as the sort toggle above: re-filter
@@ -459,7 +539,7 @@ Item {
       processData = Model.mergeProcRows(processData, null, processSortBy, processCount,
                                         processFilter)
     selectedIndex = 0
-    start(procProc)
+    start(procProc, "procProc")
   }
 
   // ─────────────────────────────────────────────── polling
@@ -470,20 +550,102 @@ Item {
   function due(period, phase, force) {
     return force ? true : (tick % period) === (phase % period)
   }
-  function start(proc) { if (!proc.running) proc.running = true }
+
+  // ── collector watchdog ──
+  //
+  // Every collector below is a short read-only shell one-liner that should
+  // finish in well under a second — but nothing stops a corrupted sysfs
+  // value or a blocked read from turning one into a subprocess that never
+  // exits. collectorStarts tracks, by name, when each currently-running
+  // collector was launched; sweepHungCollectors (on its own Timer, below)
+  // periodically asks Model.overdueCollectors which of those have run past
+  // collectorDeadlineMs and kills only those. Output size is bounded
+  // separately, at launch, by wrapCollectorCommand.
+  readonly property int collectorDeadlineMs: 8000
+  property var collectorStarts: ({})
+
+  function start(proc, name) {
+    if (proc.running) return
+    proc.running = true
+    if (name) collectorStarts[name] = Date.now()
+  }
+
+  // Bare `id`s are file-scoped identifiers, not values — there is no QML
+  // reflection from "the string name of a collector" back to the Process
+  // object it names, so the watchdog (which only has the name, recorded by
+  // start() above) needs this explicit lookup to act on one.
+  function collectorByName(name) {
+    switch (name) {
+      case "probeProc": return probeProc
+      case "gpuDetectProc": return gpuDetectProc
+      case "staticInfoProc": return staticInfoProc
+      case "cpuProc": return cpuProc
+      case "loadProc": return loadProc
+      case "memProc": return memProc
+      case "pressureProc": return pressureProc
+      case "netProc": return netProc
+      case "gpuProc": return gpuProc
+      case "nvmeListProc": return nvmeListProc
+      case "diskProc": return diskProc
+      case "smartProc": return smartProc
+      case "sensorProc": return sensorProc
+      case "fanProc": return fanProc
+      case "procProc": return procProc
+      default: return null
+    }
+  }
+
+  function sweepHungCollectors() {
+    var tracked = []
+    for (var name in collectorStarts) {
+      var p = root.collectorByName(name)
+      // start() is the only place a fresh timestamp gets written, and it
+      // only fires on a genuine relaunch — a collector that finished
+      // normally between sweeps left proc.running false without ever
+      // clearing its old timestamp here. Drop it rather than judging a
+      // process that already exited against a stale start time.
+      if (!p || !p.running) { delete collectorStarts[name]; continue }
+      tracked.push({ name: name, startedAt: collectorStarts[name], deadlineMs: root.collectorDeadlineMs })
+    }
+    var overdue = Model.overdueCollectors(tracked, Date.now())
+    for (var i = 0; i < overdue.length; i++) {
+      var n = overdue[i]
+      var proc = root.collectorByName(n)
+      // wrapCollectorCommand made every collector its own process-group
+      // leader (setsid) — killing the group, not just this one pid, is
+      // what stops a hung pipeline stage (awk, cat, smartctl…) from
+      // surviving as an orphan after the leader is gone.
+      if (proc) {
+        var pid = proc.processId
+        if (pid) Quickshell.execDetached(["bash", "-c", Model.buildGroupKillCommand(pid)])
+        if (proc.running) proc.running = false
+      }
+      delete collectorStarts[n]
+    }
+  }
+
+  Timer {
+    // Independent of baseTick/pollInterval on purpose: a slow poll interval
+    // must not also mean a slow watchdog. 2s against an 8s deadline still
+    // gives several checks' worth of margin before anything is killed.
+    interval: 2000
+    running: root.live
+    repeat: true
+    onTriggered: root.sweepHungCollectors()
+  }
 
   function runCollectors(force) {
-    if (due(mainPeriod, 0, force)) start(cpuProc)
-    if (due(mainPeriod, 1, force)) start(memProc)
-    if (due(mainPeriod, 2, force)) start(netProc)
-    if (due(mainPeriod, 3, force)) start(procProc)
-    if (due(mainPeriod, 4, force)) start(loadProc)
-    if (due(mainPeriod * 2, 5, force)) start(pressureProc)
-    if (gpuPath !== "" && due(mainPeriod * 2, 6, force)) start(gpuProc)
-    if (due(mainPeriod * 2, 7, force)) start(sensorProc)
-    if (due(mainPeriod * 2, 9, force)) start(fanProc)
-    if (due(mainPeriod * 10, 11, force)) start(diskProc)
-    if (smartAvailable && showSmartHealth && due(mainPeriod * 20, 13, force)) start(smartProc)
+    if (due(mainPeriod, 0, force)) start(cpuProc, "cpuProc")
+    if (due(mainPeriod, 1, force)) start(memProc, "memProc")
+    if (due(mainPeriod, 2, force)) start(netProc, "netProc")
+    if (due(mainPeriod, 3, force)) start(procProc, "procProc")
+    if (due(mainPeriod, 4, force)) start(loadProc, "loadProc")
+    if (due(mainPeriod * 2, 5, force)) start(pressureProc, "pressureProc")
+    if (gpuPath !== "" && due(mainPeriod * 2, 6, force)) start(gpuProc, "gpuProc")
+    if (due(mainPeriod * 2, 7, force)) start(sensorProc, "sensorProc")
+    if (due(mainPeriod * 2, 9, force)) start(fanProc, "fanProc")
+    if (due(mainPeriod * 10, 11, force)) start(diskProc, "diskProc")
+    if (smartAvailable && showSmartHealth && due(mainPeriod * 20, 13, force)) start(smartProc, "smartProc")
   }
 
   Timer {
@@ -519,19 +681,20 @@ Item {
       cpuPrimed = false
       netPrev = null
       procTicksPrev = null
-      probeProc.running = true
-      gpuDetectProc.running = true
-      staticInfoProc.running = true
+      start(probeProc, "probeProc")
+      start(gpuDetectProc, "gpuDetectProc")
+      start(staticInfoProc, "staticInfoProc")
       runCollectors(true)
     } else {
       bandwhichAccum = null
+      collectorStarts = {}
     }
   }
 
   // ─────────────────────────────────────────────── collectors
   Process {
     id: probeProc
-    command: ["bash", "-c", Model.COLLECT_TOOL_PROBE]
+    command: Model.wrapCollectorCommand(Model.COLLECT_TOOL_PROBE, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -541,14 +704,14 @@ Item {
         // or a udev rule), or via a NOPASSWD sudoers entry. Neither is assumed.
         root.smartNeedsSudo = t.indexOf("smartctl-sudo") >= 0
         root.smartAvailable = t.indexOf("smartctl-ok") >= 0 || root.smartNeedsSudo
-        if (root.smartAvailable) nvmeListProc.running = true
+        if (root.smartAvailable) root.start(nvmeListProc, "nvmeListProc")
       }
     }
   }
 
   Process {
     id: gpuDetectProc
-    command: ["bash", "-c", Model.COLLECT_GPU_PATH]
+    command: Model.wrapCollectorCommand(Model.COLLECT_GPU_PATH, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.gpuPath = String(text || "").trim()
@@ -557,10 +720,11 @@ Item {
 
   Process {
     id: staticInfoProc
-    command: ["bash", "-c",
+    command: Model.wrapCollectorCommand(
       "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'; " +
       "cut -d' ' -f1 /proc/uptime; " +
-      "ip -o -4 route show default 2>/dev/null | awk '{print $5}' | head -1"]
+      "ip -o -4 route show default 2>/dev/null | awk '{print $5}' | head -1",
+      Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -575,7 +739,7 @@ Item {
 
   Process {
     id: cpuProc
-    command: ["cat", "/proc/stat"]
+    command: Model.wrapCollectorCommand("cat /proc/stat", Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -594,7 +758,7 @@ Item {
 
   Process {
     id: loadProc
-    command: ["cat", "/proc/loadavg"]
+    command: Model.wrapCollectorCommand("cat /proc/loadavg", Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.loadInfo = Model.parseLoadAvg(text)
@@ -603,7 +767,8 @@ Item {
 
   Process {
     id: memProc
-    command: ["bash", "-c", "free -b; echo '---'; cat /sys/block/zram0/mm_stat 2>/dev/null"]
+    command: Model.wrapCollectorCommand(
+      "free -b; echo '---'; cat /sys/block/zram0/mm_stat 2>/dev/null", Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -616,7 +781,7 @@ Item {
 
   Process {
     id: pressureProc
-    command: ["bash", "-c", Model.COLLECT_PRESSURE]
+    command: Model.wrapCollectorCommand(Model.COLLECT_PRESSURE, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.pressureInfo = Model.parsePressure(text)
@@ -625,7 +790,7 @@ Item {
 
   Process {
     id: netProc
-    command: ["cat", "/proc/net/dev"]
+    command: Model.wrapCollectorCommand("cat /proc/net/dev", Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -643,7 +808,7 @@ Item {
 
   Process {
     id: gpuProc
-    command: ["bash", "-c", Model.collectGpuDetail(root.gpuPath)]
+    command: Model.wrapCollectorCommand(Model.collectGpuDetail(root.gpuPath), Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -661,20 +826,21 @@ Item {
 
   Process {
     id: nvmeListProc
-    command: ["bash", "-c", Model.COLLECT_NVME_LIST]
+    command: Model.wrapCollectorCommand(Model.COLLECT_NVME_LIST, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var list = String(text || "").trim().split("\n").filter(function(d) { return d })
         root.nvmeDevices = list
-        if (list.length > 0) root.start(smartProc)
+        if (list.length > 0) root.start(smartProc, "smartProc")
       }
     }
   }
 
   Process {
     id: diskProc
-    command: ["bash", "-c", "df -h --output=source,size,used,avail,pcent,target"]
+    command: Model.wrapCollectorCommand(
+      "df -h --output=source,size,used,avail,pcent,target", Model.OUTPUT_CAP_LARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: { root.diskData = Model.parseDfOutput(text); root.clampCursor() }
@@ -686,14 +852,14 @@ Item {
     // One invocation per drive, separated by a marker, so both NVMe devices
     // report rather than only the first. `sudo -n` never prompts: if the
     // sudoers entry is missing it fails immediately and the row says so.
-    command: ["bash", "-c", (function() {
+    command: Model.wrapCollectorCommand((function() {
       var pre = root.smartNeedsSudo ? "sudo -n " : ""
       var parts = []
       for (var i = 0; i < root.nvmeDevices.length; i++)
         parts.push("echo '@@" + root.nvmeDevices[i] + "'; "
                    + pre + "smartctl -j -a '" + root.nvmeDevices[i] + "' 2>/dev/null")
       return parts.length ? parts.join("; ") : "true"
-    })()]
+    })(), Model.OUTPUT_CAP_LARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -714,7 +880,7 @@ Item {
 
   Process {
     id: sensorProc
-    command: ["bash", "-c", Model.COLLECT_SENSORS]
+    command: Model.wrapCollectorCommand(Model.COLLECT_SENSORS, Model.OUTPUT_CAP_MEDIUM)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -726,7 +892,7 @@ Item {
 
   Process {
     id: fanProc
-    command: ["bash", "-c", Model.COLLECT_FANS]
+    command: Model.wrapCollectorCommand(Model.COLLECT_FANS, Model.OUTPUT_CAP_TINY)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fanData = Model.parseFans(text)
@@ -735,7 +901,7 @@ Item {
 
   Process {
     id: procProc
-    command: ["bash", "-c", Model.COLLECT_PROC_SNAPSHOT]
+    command: Model.wrapCollectorCommand(Model.COLLECT_PROC_SNAPSHOT, Model.OUTPUT_CAP_XLARGE)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -793,10 +959,22 @@ Item {
   // timer — `running` is bound to the window being open.
   Process {
     id: bandwhichProc
+    // No shell: bandwhich needs no pipes or redirection to run, so this is a
+    // direct argv command rather than a string built for bash -c. The
+    // interface name is also validated before it is ever allowed to reach a
+    // command line at all — see Model.isValidIfaceName — since this process
+    // runs under a granted capability (cap_net_raw/cap_net_admin) and a
+    // second layer of defense costs nothing here. `setsid --` still applies
+    // (unlike the other collectors, without wrapCollectorCommand's output
+    // cap — bandwhich runs continuously with -r, so a lifetime byte cap
+    // would kill it after a while of ordinary operation): this is the one
+    // collector expected to run for as long as the panel is open, so it is
+    // deliberately not on the hard-deadline watchdog, but it still runs
+    // under a granted capability and still deserves its own process group
+    // rather than sharing one with the rest of the plugin.
     running: root.live && root.showBandwhich && root.bandwhichAvailable
-             && root.primaryIface !== ""
-    command: ["bash", "-c",
-      "bandwhich -r -p -i " + (root.primaryIface || "lo") + " 2>/dev/null"]
+             && Model.isValidIfaceName(root.primaryIface)
+    command: ["setsid", "--", "bandwhich", "-r", "-p", "-i", root.primaryIface]
     stdout: SplitParser {
       onRead: function(line) {
         // Rows are summed per process and keyed on bandwhich's refresh
@@ -809,12 +987,39 @@ Item {
     }
   }
 
+  // Unprivileged pre-check for both grantBandwhich and grantSmart — see the
+  // comment above those functions. Runs with no elevation at all: reading a
+  // file's path/type/owner and checking pacman's package database need no
+  // special access, so there is nothing here for pkexec to ever be asked
+  // about if this step is the one that fails.
+  Process {
+    id: grantValidateProc
+    property string pendingTarget: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var v = Model.parseExecutableValidation(text)
+        if (!v.ok) {
+          root.grantBusy = ""
+          root.grantError = "cannot grant: " + v.reasons.join("; ")
+          return
+        }
+        if (grantValidateProc.pendingTarget === "bandwhich") root.proceedGrantBandwhich(v.realPath)
+        else if (grantValidateProc.pendingTarget === "smartctl") root.proceedGrantSmart(v.realPath)
+      }
+    }
+  }
+
   Process {
     id: grantProc
+    property string pendingLabel: ""
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var m = String(text || "").trim()
+        // pkexec/setcap/visudo stderr is genuinely external text with no
+        // length guarantee — bounded here, at the one place it enters the
+        // plugin, rather than trusting every later reader to bound it.
+        var m = Model.truncateDisplay(String(text || "").trim(), 300)
         if (m !== "") root.grantError = m
       }
     }
@@ -822,13 +1027,20 @@ Item {
       root.grantBusy = ""
       if (exitCode === 0) {
         root.grantError = ""
-        probeProc.running = true          // re-probe; the section lights up
+        root.start(probeProc, "probeProc")   // re-probe; the section relights either way
       } else if (exitCode === 126 || exitCode === 127) {
         // pkexec's "dismissed" and "not authorised" — a cancelled password
         // prompt is a decision, not a failure to report.
         root.grantError = ""
+      } else if (exitCode === 23 && root.grantAction === "revoke") {
+        // buildRevokeCapabilityScript's own refusal: no backup on file for
+        // this capability, meaning this plugin never actually granted it —
+        // most likely it predates the plugin entirely (bandwhich's own
+        // docs recommend this exact setcap line as a manual step). Nothing
+        // was touched; say so plainly rather than a bare exit code.
+        root.grantError = "not revoked: this capability was not granted by this plugin, so there is nothing on file to safely restore"
       } else if (root.grantError === "") {
-        root.grantError = "grant failed (exit " + exitCode + ")"
+        root.grantError = (grantProc.pendingLabel || root.grantAction || "grant") + " failed (exit " + exitCode + ")"
       }
     }
   }
@@ -849,7 +1061,7 @@ Item {
       if (exitCode === 0) {
         root.confirmKillPid = -1
         if (root.selectedProcess) root.backToList()
-        root.start(procProc)
+        root.start(procProc, "procProc")
       }
     }
   }
@@ -944,10 +1156,10 @@ Item {
         }
         // x/X is bound inside PanelKeyCatcher and never reaches onTextKey.
         onDeleteRequested: {
-          if (root.selectedProcess) root.killProcess(root.selectedProcess.pid, "TERM")
+          if (root.selectedProcess) root.killProcess(root.selectedProcess.pid, "TERM", root.selectedProcess)
           else if (root.focusSection === "processes" && root.selectedIndex >= 0
                    && root.selectedIndex < root.processView.length)
-            root.killProcess(root.processView[root.selectedIndex].pid, "TERM")
+            root.killProcess(root.processView[root.selectedIndex].pid, "TERM", root.processView[root.selectedIndex])
         }
         onTextKey: function(t) {
           if (t === "r" || t === "R") root.refreshAll()
@@ -1038,7 +1250,7 @@ Item {
                 visible: root.hottest !== null
                 label: "TEMP"
                 value: root.hottest
-                       ? root.hottest.display + " " + Model.formatTemp(root.hottest.tempC)
+                       ? Model.truncateDisplay(root.hottest.display, 40) + " " + Model.formatTemp(root.hottest.tempC)
                        : ""
                 warn: root.hottest ? root.hottest.tempC >= 80 : false
               }
@@ -1110,7 +1322,8 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.leftMargin: Style.space(10)
                 anchors.rightMargin: Style.space(10)
-                text: root.actionError
+                textFormat: Text.PlainText
+                text: Model.truncateDisplay(root.actionError, 300)
                 color: root.urgent
                 font.family: root.fontFamily
                 font.pixelSize: root.fsSmall
@@ -1135,7 +1348,8 @@ Item {
                 }
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
-                  text: root.selectedProcess ? root.selectedProcess.command : ""
+                  textFormat: Text.PlainText
+                  text: root.selectedProcess ? Model.truncateDisplay(root.selectedProcess.command, 64) : ""
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: root.fsTitle
@@ -1154,7 +1368,7 @@ Item {
                 DetailValue { text: root.selectedProcess ? String(root.selectedProcess.ppid) : "" }
 
                 DetailLabel { text: "User" }
-                DetailValue { text: root.selectedProcess ? root.selectedProcess.user : "" }
+                DetailValue { text: root.selectedProcess ? Model.truncateDisplay(root.selectedProcess.user, 64) : "" }
                 DetailLabel { text: "State" }
                 DetailValue { text: root.selectedProcess ? Model.formatState(root.selectedProcess.stat) : "" }
 
@@ -1201,7 +1415,7 @@ Item {
                   // broken.
                   text: root.selectedProcess && root.selectedProcess.elapsed !== undefined
                         ? Model.formatUptime(root.selectedProcess.elapsed + root.detailTick)
-                          + "   (since " + (root.procDetail ? root.procDetail.started : "") + ")"
+                          + "   (since " + Model.truncateDisplay(root.procDetail ? root.procDetail.started : "", 64) + ")"
                         : ""
                 }
                 DetailLabel { text: "" }
@@ -1214,8 +1428,9 @@ Item {
               DetailLabel { text: "Executable" }
               Text {
                 width: page.width
+                textFormat: Text.PlainText
                 text: root.procDetail && root.procDetail.exe !== ""
-                      ? root.procDetail.exe
+                      ? Model.truncateDisplay(root.procDetail.exe, 500)
                       : (root.selectedProcess && !root.ownsProcess(root.selectedProcess)
                          ? "— not readable for another user's process" : "—")
                 color: root.procDetail && root.procDetail.exe !== "" ? root.foreground : root.dimmer
@@ -1229,8 +1444,9 @@ Item {
               DetailLabel { text: "Working directory" }
               Text {
                 width: page.width
+                textFormat: Text.PlainText
                 text: root.procDetail && root.procDetail.cwd !== ""
-                      ? root.procDetail.cwd
+                      ? Model.truncateDisplay(root.procDetail.cwd, 500)
                       : (root.selectedProcess && !root.ownsProcess(root.selectedProcess)
                          ? "— not readable for another user's process" : "—")
                 color: root.procDetail && root.procDetail.cwd !== "" ? root.foreground : root.dimmer
@@ -1254,12 +1470,17 @@ Item {
                 visible: root.procDetail !== null && root.procDetail.chain.length > 1
 
                 Repeater {
+                  // Walked to at most 8 ancestor hops by the collector shell
+                  // script itself (Model.collectProcDetail) — the count is
+                  // already bounded upstream; this only bounds each entry's
+                  // own text.
                   model: root.procDetail ? root.procDetail.chain : []
                   delegate: Text {
                     required property var modelData
                     required property int index
+                    textFormat: Text.PlainText
                     text: (index === 0 ? "" : "  ".repeat(index) + "└ ")
-                          + modelData.comm + "  (" + modelData.pid + ")"
+                          + Model.truncateDisplay(modelData.comm, 64) + "  (" + modelData.pid + ")"
                     color: index === 0 ? root.foreground : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: root.fsSmall
@@ -1272,7 +1493,8 @@ Item {
               DetailLabel { text: "Command line" }
               Text {
                 width: page.width
-                text: root.selectedProcess ? root.selectedProcess.fullCommand : ""
+                textFormat: Text.PlainText
+                text: root.selectedProcess ? Model.truncateDisplay(root.selectedProcess.fullCommand, 1000) : ""
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: root.fsSmall
@@ -1284,7 +1506,8 @@ Item {
               Text {
                 width: page.width
                 visible: root.selectedProcess !== null && !root.ownsProcess(root.selectedProcess)
-                text: "Owned by " + (root.selectedProcess ? root.selectedProcess.user : "")
+                textFormat: Text.PlainText
+                text: "Owned by " + Model.truncateDisplay(root.selectedProcess ? root.selectedProcess.user : "", 64)
                       + " — signals require elevated privileges."
                 color: root.urgent
                 opacity: 0.85
@@ -1302,7 +1525,7 @@ Item {
                   foreground: root.foreground; fontFamily: root.fontFamily
                   hoverColor: root.urgent
                   enabled: root.ownsProcess(root.selectedProcess)
-                  onClicked: root.killProcess(root.selectedProcess.pid, "TERM")
+                  onClicked: root.killProcess(root.selectedProcess.pid, "TERM", root.selectedProcess)
                 }
                 PanelActionButton {
                   iconText: "󰚌"; tooltipText: "Force kill (SIGKILL)"
@@ -1315,7 +1538,7 @@ Item {
                   iconText: "󰓅"; tooltipText: "Lower priority (renice +10)"
                   foreground: root.foreground; fontFamily: root.fontFamily
                   enabled: root.ownsProcess(root.selectedProcess)
-                  onClicked: root.reniceProcess(root.selectedProcess.pid, 10)
+                  onClicked: root.reniceProcess(root.selectedProcess.pid, 10, root.selectedProcess)
                 }
                 PanelActionButton {
                   iconText: "󰈔"; tooltipText: "Open files (lsof)"
@@ -1340,7 +1563,12 @@ Item {
                   iconText: "󰄬"; tooltipText: "Confirm SIGKILL"
                   foreground: root.foreground; fontFamily: root.fontFamily
                   hoverColor: root.urgent
-                  onClicked: root.killProcess(root.confirmKillPid, "KILL")
+                  // The confirm step never navigates away (both this Row and
+                  // the buttons that could reselect a process are hidden
+                  // while confirmKillPid >= 0, and backToList() clears
+                  // confirmKillPid itself) — selectedProcess is still the
+                  // same row that was chosen when the confirm prompt opened.
+                  onClicked: root.killProcess(root.confirmKillPid, "KILL", root.selectedProcess)
                 }
                 PanelActionButton {
                   iconText: "󰜺"; tooltipText: "Cancel"
@@ -1402,7 +1630,8 @@ Item {
               Text {
                 width: parent.width
                 visible: root.cpuModelShort !== ""
-                text: root.cpuModelShort
+                textFormat: Text.PlainText
+                text: Model.truncateDisplay(root.cpuModelShort, 200)
                       + (root.cpuCorePercents.length > 0
                          ? "     " + root.cpuCorePercents.length + " threads" : "")
                 color: root.dimmer
@@ -1560,11 +1789,17 @@ Item {
                     width: parent.width
                     visible: root.gpuInfo !== null
                              && (root.gpuInfo.clocks.length > 0 || root.gpuInfo.fanRpm > 0)
+                    textFormat: Text.PlainText
                     text: {
                       if (!root.gpuInfo) return ""
                       var bits = []
-                      for (var i = 0; i < root.gpuInfo.clocks.length; i++)
-                        bits.push(root.gpuInfo.clocks[i].name + " "
+                      // A real card exposes a handful of clock domains; this
+                      // cap is headroom, not a real-world limit — it exists
+                      // so a sysfs reading no one has seen yet cannot turn
+                      // one line into an unbounded one.
+                      var n = Math.min(root.gpuInfo.clocks.length, 12)
+                      for (var i = 0; i < n; i++)
+                        bits.push(Model.truncateDisplay(root.gpuInfo.clocks[i].name, 40) + " "
                                   + Model.formatMHz(root.gpuInfo.clocks[i].mhz))
                       if (root.gpuInfo.fanRpm > 0) bits.push(root.gpuInfo.fanRpm + " RPM")
                       return bits.join("     ")
@@ -1580,11 +1815,13 @@ Item {
                   Text {
                     width: parent.width
                     visible: root.gpuInfo !== null && root.gpuInfo.temps.length > 0
+                    textFormat: Text.PlainText
                     text: {
                       if (!root.gpuInfo) return ""
                       var bits = []
-                      for (var i = 0; i < root.gpuInfo.temps.length; i++)
-                        bits.push(root.gpuInfo.temps[i].label + " "
+                      var n = Math.min(root.gpuInfo.temps.length, 12)
+                      for (var i = 0; i < n; i++)
+                        bits.push(Model.truncateDisplay(root.gpuInfo.temps[i].label, 40) + " "
                                   + Model.formatTemp(root.gpuInfo.temps[i].tempC))
                       return bits.join("     ")
                     }
@@ -1630,11 +1867,15 @@ Item {
                   }
 
                   Repeater {
+                    // Row count is already bounded upstream: the collector
+                    // globs /dev/nvme?n1 (Model.COLLECT_NVME_LIST), a single
+                    // digit, so at most 10 devices are ever in smartList.
                     model: root.showSmartHealth ? root.smartList : []
                     delegate: Text {
                       required property var modelData
                       width: rightCol.width
-                      text: modelData.device.replace("/dev/", "") + "   "
+                      textFormat: Text.PlainText
+                      text: Model.truncateDisplay(modelData.device.replace("/dev/", ""), 40) + "   "
                             + Model.formatTemp(modelData.temp)
                             + "   wear " + modelData.wearPercent + "%"
                             + "   " + modelData.powerOnHours + "h"
@@ -1666,6 +1907,11 @@ Item {
                     busy: root.grantBusy === "smartctl"
                     onTriggered: root.grantSmart()
                   }
+                  RevokeRow {
+                    visible: root.showSmartHealth && root.smartAvailable
+                    busy: root.grantBusy === "smartctl"
+                    onTriggered: root.revokeSmart()
+                  }
 
                   PanelSeparator { width: parent.width; foreground: root.foreground }
 
@@ -1673,7 +1919,14 @@ Item {
                     width: parent.width
                     title: "NETWORK"
                     Component.onCompleted: root.registerAnchor("network", this)
-                    value: root.primaryIface
+                    // SectionHeader is a shared component outside this
+                    // plugin, so its own Text internals can't be set from
+                    // here — bounding the string handed to it is what this
+                    // call site can control. (The command-construction path
+                    // for this same interface name is additionally gated by
+                    // Model.isValidIfaceName — see bandwhichProc — this is
+                    // display-only defense in depth, not that check.)
+                    value: Model.truncateDisplay(root.primaryIface, 40)
                   }
 
                   Text {
@@ -1714,8 +1967,9 @@ Item {
                         // bandwhich's own label for traffic it could not map to
                         // a process: without root it cannot inspect another
                         // user's sockets. Named plainly rather than left raw.
+                        textFormat: Text.PlainText
                         text: Model.isUnattributed(modelData.process)
-                              ? "unattributed" : modelData.process
+                              ? "unattributed" : Model.truncateDisplay(modelData.process, 64)
                         color: root.dimmer
                         opacity: Model.isUnattributed(modelData.process) ? 0.7 : 1.0
                         font.family: root.fontFamily
@@ -1731,6 +1985,11 @@ Item {
                     explain: "Per-process network needs packet-capture permission."
                     busy: root.grantBusy === "bandwhich"
                     onTriggered: root.grantBandwhich()
+                  }
+                  RevokeRow {
+                    visible: root.showBandwhich && root.bandwhichAvailable
+                    busy: root.grantBusy === "bandwhich"
+                    onTriggered: root.revokeBandwhich()
                   }
                 }
               }
@@ -1792,8 +2051,14 @@ Item {
                   anchors.rightMargin: Style.space(6)
                   anchors.verticalCenter: parent.verticalCenter
                   iconText: "󰍉"
+                  // processFilter is typed locally by whoever is sitting at
+                  // this panel, not data arriving from a process/device/
+                  // subprocess — a different trust level than the rest of
+                  // this sweep. Still bounded before it reaches the external
+                  // tooltip renderer, for the same reason as everywhere else:
+                  // this call site cannot confirm that renderer's textFormat.
                   tooltipText: root.processFilter !== ""
-                               ? "Filtering “" + root.processFilter + "” — click to edit (/)"
+                               ? "Filtering “" + Model.truncateDisplay(root.processFilter, 100) + "” — click to edit (/)"
                                : "Search processes by name or pid (/)"
                   foreground: root.processFilter !== "" ? root.accent : root.foreground
                   fontFamily: root.fontFamily
@@ -2032,10 +2297,14 @@ Item {
       // Disabled rather than left to fail: kill returns EPERM on another
       // user's process and the row merely not vanishing reads as a bug.
       enabled: pr.proc ? root.ownsProcess(pr.proc) : false
+      // PanelActionButton is a shared component outside this plugin, so
+      // whatever textFormat its own internal Text uses can't be set from
+      // here — bounding the string before it is handed over is what this
+      // call site can actually control.
       tooltipText: pr.proc && root.ownsProcess(pr.proc)
                    ? "Terminate (SIGTERM)"
-                   : "Owned by " + (pr.proc ? pr.proc.user : "") + " — needs privileges"
-      onClicked: root.killProcess(pr.proc.pid, "TERM")
+                   : "Owned by " + Model.truncateDisplay(pr.proc ? pr.proc.user : "", 64) + " — needs privileges"
+      onClicked: root.killProcess(pr.proc.pid, "TERM", pr.proc)
     }
 
     Text {
@@ -2109,7 +2378,8 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       visible: root.showProcUser
       width: visible ? root.colUser : 0
-      text: pr.proc ? pr.proc.user : ""
+      textFormat: Text.PlainText
+      text: pr.proc ? Model.truncateDisplay(pr.proc.user, 64) : ""
       color: pr.proc && root.ownsProcess(pr.proc) ? root.dim : root.dimmer
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
       elide: Text.ElideRight
@@ -2132,7 +2402,8 @@ Item {
       anchors.right: prPid.left
       anchors.rightMargin: root.colGap
       anchors.verticalCenter: parent.verticalCenter
-      text: pr.proc ? pr.proc.command : ""
+      textFormat: Text.PlainText
+      text: pr.proc ? Model.truncateDisplay(pr.proc.command, 128) : ""
       color: root.foreground
       font.family: root.fontFamily; font.pixelSize: root.fsSmall
       elide: Text.ElideRight
@@ -2185,8 +2456,9 @@ Item {
         Text {
           id: drMount
           anchors.left: parent.left
+          textFormat: Text.PlainText
           text: dr.disk
-                ? dr.disk.mount + (dr.disk.mounts.length > 1
+                ? Model.truncateDisplay(dr.disk.mount, 200) + (dr.disk.mounts.length > 1
                     ? "  (+" + (dr.disk.mounts.length - 1) + ")" : "") : ""
           color: root.foreground
           font.family: root.fontFamily
@@ -2194,7 +2466,8 @@ Item {
         }
         Text {
           anchors.right: parent.right
-          text: dr.disk ? dr.disk.used + " / " + dr.disk.size : ""
+          textFormat: Text.PlainText
+          text: dr.disk ? Model.truncateDisplay(dr.disk.used, 20) + " / " + Model.truncateDisplay(dr.disk.size, 20) : ""
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: root.fsSmall
@@ -2297,12 +2570,46 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         visible: root.grantError !== ""
         width: Math.max(0, gr.width - Style.space(140))
+        // Already bounded where it is set (grantProc.stderr, above) — plain
+        // text here regardless, since raw pkexec/setcap/visudo stderr is
+        // exactly the kind of content this element must never interpret as
+        // markup.
+        textFormat: Text.PlainText
         text: root.grantError
         color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: root.fsCaption
         elide: Text.ElideRight
       }
+    }
+  }
+
+  // The opposite state from GrantRow, shown once a capability is active —
+  // the in-panel half of the uninstall path this section's review asked
+  // for: a way back to "not granted" without uninstalling the whole
+  // plugin, which `omarchy plugin remove` does not undo on its own (see
+  // README → Uninstall).
+  component RevokeRow: Row {
+    id: rr
+    property bool busy: false
+    signal triggered()
+    spacing: Style.space(8)
+
+    Text {
+      anchors.verticalCenter: parent.verticalCenter
+      text: "Enabled"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: root.fsCaption
+    }
+    PanelActionButton {
+      anchors.verticalCenter: parent.verticalCenter
+      iconText: "󰜺"
+      tooltipText: rr.busy ? "Revoking…" : "Revoke this permission"
+      foreground: root.dimmer
+      hoverColor: root.urgent
+      enabled: !rr.busy
+      onClicked: rr.triggered()
     }
   }
 
@@ -2322,6 +2629,11 @@ Item {
       font.pixelSize: root.fsCaption
     }
     Text {
+      // Every Stat except TEMP is purely numeric; TEMP's value can carry a
+      // hwmon driver name (Model.friendlySensorName's unmapped fallback) —
+      // plain text for all six rather than special-casing the one that
+      // needs it.
+      textFormat: Text.PlainText
       text: parent.value
       color: parent.warn ? root.urgent : root.foreground
       font.family: root.fontFamily
@@ -2496,6 +2808,11 @@ Item {
   }
 
   component DetailValue: Text {
+    // Every field this renders eventually includes at least one that came
+    // from outside the plugin (comm, user, the ancestry/exe/cwd/cmdline
+    // values set elsewhere) — plain text only, no rich-text/markup
+    // interpretation of process-controlled strings.
+    textFormat: Text.PlainText
     color: root.foreground
     font.family: root.fontFamily
     font.pixelSize: root.fsBody
