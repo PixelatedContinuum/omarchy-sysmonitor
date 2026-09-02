@@ -471,6 +471,23 @@ function isValidIfaceName(name) {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,14}$/.test(String(name || ""))
 }
 
+// POSIX/useradd-style username shape: a lowercase letter or underscore,
+// then lowercase letters/digits/underscore/hyphen, with an optional
+// trailing $ (Samba machine accounts). Checked even though the value
+// normally comes straight from $USER for the already-logged-in account,
+// not attacker input in the ordinary case — the same reasoning as
+// isValidIfaceName above: relying on an upstream source's assumed-safe
+// character set is exactly the assumption that stops holding the moment
+// anything upstream changes. Here the value is concatenated directly into
+// a root-owned sudoers principal field (smartSudoersRule below), where a
+// `#`-comment or a second `ALL=(ALL) NOPASSWD:` clause smuggled through
+// the "username" would grant far more than the one narrow command this
+// plugin intends — and unlike a malformed sudoers line, an INJECTED one
+// is syntactically valid, so `visudo -cf` cannot catch it downstream.
+function isValidUsername(name) {
+  return /^[a-z_][a-z0-9_-]{0,31}\$?$/.test(String(name || ""))
+}
+
 // Bounds a string before it reaches a Text element, for every value on this
 // panel that ultimately comes from outside the plugin — a process name, a
 // mount path, a device or sensor label, subprocess stderr. None of those
@@ -729,9 +746,14 @@ function buildCollisionSafeInstallScript(targetPath, content, mode, owner, group
   var o = String(owner || "root")
   var g = String(group || "root")
   var validate = validateCmd ? (validateCmd + " \"$t\" && ") : ""
+  // The backup name is reserved with mktemp (which creates the file
+  // atomically), not a second-resolution timestamp: two collisions inside
+  // the same second used to reuse the same `.bak-$(date +%s)` name and the
+  // second `cp -p` silently overwrote the first backup, exactly the
+  // silent-overwrite this function exists to prevent.
   return "t=$(mktemp) && printf '%s' " + sq(String(content || "")) + " > \"$t\" && chmod " + m + " \"$t\" && " +
     validate +
-    "{ [ -e " + tp + " ] && ! cmp -s \"$t\" " + tp + " && cp -p " + tp + " " + tp + ".bak-$(date +%s) 2>/dev/null; true; } && " +
+    "{ [ -e " + tp + " ] && ! cmp -s \"$t\" " + tp + " && bak=$(mktemp " + tp + ".bak-XXXXXX 2>/dev/null) && cp -p " + tp + " \"$bak\" 2>/dev/null; true; } && " +
     "install -m " + m + " -o " + o + " -g " + g + " \"$t\" " + tp + "; " +
     "rc=$?; rm -f \"$t\"; exit $rc"
 }
@@ -774,8 +796,16 @@ function smartHelperScript(smartctlPath) {
     "done\n"
 }
 
+// Returns "" (not a rule) for a username that fails isValidUsername — never
+// a best-effort rule built from unchecked input. "" is itself a fail-safe
+// value: visudo -cf already rejects an empty principal line with a syntax
+// error, but buildGrantSmartScript below does not even rely on that; it
+// checks isValidUsername directly and refuses to build an install attempt
+// at all, since an injected "username" produces syntactically VALID
+// sudoers content that visudo -cf cannot distinguish from a real one.
 function smartSudoersRule(username) {
-  return String(username || "") + " ALL=(root) NOPASSWD: " + SMART_HELPER_PATH + "\n"
+  if (!isValidUsername(username)) return ""
+  return String(username) + " ALL=(root) NOPASSWD: " + SMART_HELPER_PATH + "\n"
 }
 
 // Full grant script: install the helper (0755, root:root) then the
@@ -784,7 +814,13 @@ function smartSudoersRule(username) {
 // file at either path is backed up rather than clobbered, and a helper
 // that fails to install correctly never leaves a sudoers rule pointing at
 // a script that is not what this plugin actually shipped.
+//
+// username is validated here, not just inside smartSudoersRule, so a bad
+// value stops the whole grant (helper install included) rather than
+// producing a helper with no sudoers rule able to reach it.
 function buildGrantSmartScript(username, smartctlPath) {
+  if (!isValidUsername(username))
+    return "echo 'invalid username, refusing to install a sudoers rule' >&2; exit 24"
   var helper = buildCollisionSafeInstallScript(SMART_HELPER_PATH, smartHelperScript(smartctlPath), "0755", "root", "root", null)
   var sudoers = buildCollisionSafeInstallScript(SMART_SUDOERS_PATH, smartSudoersRule(username), "0440", "root", "root", "visudo -cf")
   return "(" + helper + ") && (" + sudoers + ")"
@@ -1412,6 +1448,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildGrantSmartScript: buildGrantSmartScript,
     buildRevokeSmartScript: buildRevokeSmartScript,
     isValidIfaceName: isValidIfaceName,
+    isValidUsername: isValidUsername,
     truncateDisplay: truncateDisplay,
     formatState: formatState,
     parseSmartHealth: parseSmartHealth,

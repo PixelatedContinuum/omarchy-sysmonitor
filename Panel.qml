@@ -304,6 +304,14 @@ Item {
   }
 
   // ─────────────────────────────────────────────── actions
+  //
+  // detailProc and procDetailProc below are not periodic collectors: they
+  // fire once here, on selection, not on a recurring timer (detailTick is a
+  // display-only counter that extrapolates elapsed time in the UI between
+  // polls, it never relaunches either process). Neither goes through
+  // wrapCollectorCommand or the watchdog for that reason, matching the
+  // review's own "periodic subprocess collectors" scoping. Model.collectProcDetail
+  // still bounds its own ancestry walk to 8 hops regardless (see Model.js).
   function selectProcess(proc) {
     if (!proc) return
     actionError = ""
@@ -362,22 +370,30 @@ Item {
   // comm/user of "" and elapsed of -1 can never match a real process), so
   // the fallback direction is "refuse", never "skip the check".
   function killProcess(pid, signal, procRow) {
-    if (pid <= 0) return
+    // Coerced before the guard AND before it is embedded in actionCmd: `pid
+    // <= 0` on a non-numeric string coerces to NaN, which is never <= 0,
+    // so a stray non-integer would previously skip the guard and land in
+    // the action string verbatim. Every current call site already passes a
+    // real integer, so this closes a latent path rather than a reachable
+    // one.
+    var p = parseInt(pid, 10) || 0
+    if (p <= 0) return
     actionError = ""
-    actionProc.pendingLabel = "kill -" + signal + " " + pid
+    actionProc.pendingLabel = "kill -" + signal + " " + p
     actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
-      pid, "kill -" + signal + " " + String(pid),
+      p, "kill -" + signal + " " + String(p),
       procRow ? procRow.user : "", procRow ? procRow.command : "",
       root.expectedElapsedFor(procRow))]
     actionProc.running = true
   }
 
   function reniceProcess(pid, nice, procRow) {
-    if (pid <= 0) return
+    var p = parseInt(pid, 10) || 0
+    if (p <= 0) return
     actionError = ""
-    actionProc.pendingLabel = "renice " + nice + " " + pid
+    actionProc.pendingLabel = "renice " + nice + " " + p
     actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
-      pid, "renice -n " + nice + " -p " + String(pid),
+      p, "renice -n " + nice + " -p " + String(p),
       procRow ? procRow.user : "", procRow ? procRow.command : "",
       root.expectedElapsedFor(procRow))]
     actionProc.running = true
@@ -1039,6 +1055,13 @@ Item {
         // docs recommend this exact setcap line as a manual step). Nothing
         // was touched; say so plainly rather than a bare exit code.
         root.grantError = "not revoked: this capability was not granted by this plugin, so there is nothing on file to safely restore"
+      } else if (exitCode === 24) {
+        // Model.buildGrantSmartScript's own refusal: the account name read
+        // from the environment did not pass Model.isValidUsername, so no
+        // sudoers rule was built at all. Surfacing this plainly matters
+        // more than most refusals here, since a rule built from that value
+        // would have been syntactically valid and passed visudo -cf clean.
+        root.grantError = "not granted: could not validate the account name; no sudoers rule was written"
       } else if (root.grantError === "") {
         root.grantError = (grantProc.pendingLabel || root.grantAction || "grant") + " failed (exit " + exitCode + ")"
       }
@@ -1919,13 +1942,13 @@ Item {
                     width: parent.width
                     title: "NETWORK"
                     Component.onCompleted: root.registerAnchor("network", this)
-                    // SectionHeader is a shared component outside this
-                    // plugin, so its own Text internals can't be set from
-                    // here — bounding the string handed to it is what this
-                    // call site can control. (The command-construction path
-                    // for this same interface name is additionally gated by
-                    // Model.isValidIfaceName — see bandwhichProc — this is
-                    // display-only defense in depth, not that check.)
+                    // Length-capped here for defense in depth; the value
+                    // Text this feeds (SectionHeader's shVal, defined lower
+                    // in this file) already sets Text.PlainText. The
+                    // command-construction path for this same interface
+                    // name is separately gated by Model.isValidIfaceName
+                    // (see bandwhichProc), which is a different check for a
+                    // different purpose, not a duplicate of this one.
                     value: Model.truncateDisplay(root.primaryIface, 40)
                   }
 
@@ -2710,6 +2733,13 @@ Item {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       horizontalAlignment: Text.AlignRight
+      // Most SectionHeader values are numeric, but NETWORK's is the raw
+      // interface name — plain text for all of them rather than special-
+      // casing the one that needs it. This component (SectionHeader) is
+      // defined right here in this file; it wraps the genuinely-external
+      // PanelSectionHeader only for the static title label above, not for
+      // this value.
+      textFormat: Text.PlainText
       text: sh.value
       color: root.dim
       elide: Text.ElideRight

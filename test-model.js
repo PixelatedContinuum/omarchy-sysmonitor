@@ -172,6 +172,32 @@ check("live default-route interface name (if any) passes the validator", (functi
   return M.isValidIfaceName(iface)
 })())
 
+section("isValidUsername — the gate before an account name reaches a sudoers principal field")
+check("accepts ordinary usernames",
+      ["jharrison", "root", "_apt", "www-data", "user123", "a", "user-name"]
+        .every(function(n) { return M.isValidUsername(n) }))
+check("accepts a trailing $ (Samba machine account convention)",
+      M.isValidUsername("workstation$"))
+check("accepts the maximum length (32 chars)",
+      M.isValidUsername("a" + "b".repeat(31)))
+check("rejects one character over the maximum length",
+      !M.isValidUsername("a" + "b".repeat(32)))
+check("rejects the exact sudoers-injection string this validator exists to stop",
+      !M.isValidUsername("bad ALL=(ALL) NOPASSWD: /bin/bash #"))
+check("rejects shell/sudoers metacharacters generally",
+      ["user name", "user;id", "user#comment", "user\nALL=(ALL)", "user'quote", "user\"quote",
+       "user`id`", "user$(id)", "ALL", "user ALL=(ALL) NOPASSWD: /bin/bash"]
+        .every(function(n) { return !M.isValidUsername(n) }))
+check("rejects empty, null, and non-string input",
+      !M.isValidUsername("") && !M.isValidUsername(null) && !M.isValidUsername(undefined))
+check("rejects uppercase and a name starting with a digit or hyphen",
+      !M.isValidUsername("Jharrison") && !M.isValidUsername("1user") && !M.isValidUsername("-user"))
+check("live: the actual account this suite is running as passes the validator", (function() {
+  var me = (sh("whoami") || "").trim()
+  if (!me) return true
+  return M.isValidUsername(me)
+})())
+
 section("truncateDisplay — the length bound before external data reaches a Text element")
 check("passes a short string through unchanged",
       M.truncateDisplay("eth0", 64) === "eth0")
@@ -414,6 +440,31 @@ check("a failing validator leaves the existing target completely untouched",
         try { cp.execSync(built, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { threw = true }
         return threw && fs.readFileSync(csiTarget, "utf8") === before && csiBackups().length === backupsBefore
       })())
+check("two same-second collisions each keep their own backup, neither clobbers the other",
+      (function() {
+        // The bug this regresses: backups named `.bak-$(date +%s)` reuse
+        // the same filename for any two collisions inside one second, and
+        // the second `cp -p` silently overwrote the first backup. Two
+        // install calls back to back, with no sleep between them, is
+        // exactly that scenario. A dedicated target, not csiTarget: the
+        // checks above already left it with a backup of their own, and
+        // this needs to count from a clean zero to mean anything.
+        var t = "/tmp/sysmonitor-test-csi-collision-" + process.pid
+        function backupsOf(target) {
+          var base = target.split("/").pop()
+          return fs.readdirSync("/tmp").filter(function(f) { return f.indexOf(base + ".bak") === 0 })
+        }
+        try { fs.unlinkSync(t) } catch (e) {}
+        backupsOf(t).forEach(function(f) { try { fs.unlinkSync("/tmp/" + f) } catch (e) {} })
+        sh(M.buildCollisionSafeInstallScript(t, "gen-0", "0644", "", "", null))  // baseline, no backup yet
+        sh(M.buildCollisionSafeInstallScript(t, "gen-1", "0644", "", "", null))  // backs up gen-0
+        sh(M.buildCollisionSafeInstallScript(t, "gen-2", "0644", "", "", null))  // backs up gen-1, same tick
+        var backups = backupsOf(t)
+        var contents = backups.map(function(f) { return fs.readFileSync("/tmp/" + f, "utf8") }).sort()
+        backups.forEach(function(f) { try { fs.unlinkSync("/tmp/" + f) } catch (e) {} })
+        try { fs.unlinkSync(t) } catch (e) {}
+        return backups.length === 2 && contents[0] === "gen-0" && contents[1] === "gen-1"
+      })())
 csiBackups().forEach(function(f) { try { fs.unlinkSync("/tmp/" + f) } catch (e) {} })
 try { fs.unlinkSync(csiTarget) } catch (e) {}
 
@@ -455,6 +506,31 @@ check("buildGrantSmartScript references both fixed paths and the visudo gate",
         var g = M.buildGrantSmartScript("someuser")
         return g.indexOf(M.SMART_HELPER_PATH) >= 0 && g.indexOf(M.SMART_SUDOERS_PATH) >= 0
             && g.indexOf("visudo -cf") >= 0
+      })())
+check("smartSudoersRule refuses to build a rule for an invalid username, even one that would itself pass visudo -cf",
+      (function() {
+        // This is the exact injection a real account-name source could
+        // hand this function: syntactically valid sudoers content that
+        // visudo -cf cannot distinguish from a legitimate rule, so the
+        // defense has to be at this function, not downstream of it.
+        var evil = "bad ALL=(ALL) NOPASSWD: /bin/bash #"
+        var rule = M.smartSudoersRule(evil)
+        if (rule !== "") return false
+        // Confirm the premise: had this NOT been refused, visudo -cf alone
+        // would not have caught it (proving the gate has to live here).
+        var p = "/tmp/sysmonitor-test-would-be-evil"
+        fs.writeFileSync(p, evil + " ALL=(root) NOPASSWD: " + M.SMART_HELPER_PATH + "\n")
+        var visudoWouldAccept = true
+        try { cp.execSync("visudo -cf " + p, { stdio: ["ignore", "pipe", "pipe"] }) } catch (e) { visudoWouldAccept = false }
+        fs.unlinkSync(p)
+        return visudoWouldAccept   // true confirms visudo alone is not the defense
+      })())
+check("buildGrantSmartScript refuses (exit 24) an invalid username before building any install script",
+      (function() {
+        var g = M.buildGrantSmartScript("bad ALL=(ALL) NOPASSWD: /bin/bash #")
+        var r = runScript(g)
+        return !r.ok && r.status === 24
+            && g.indexOf(M.SMART_SUDOERS_PATH) < 0   // the sudoers path is never even referenced
       })())
 check("live: the helper-then-sudoers install chain actually gates — a failing first half skips the second entirely",
       (function() {
