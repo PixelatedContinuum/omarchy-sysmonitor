@@ -455,17 +455,6 @@ Item {
     return proc ? Model.userMatches(proc.user, root.currentUser) : false
   }
 
-  // Estimated CURRENT elapsed time for a process row last refreshed by a
-  // poll — used only to build the tolerance window in killProcess /
-  // reniceProcess below, never displayed. Extrapolates from the row's own
-  // elapsed (as of the poll that produced it) plus wall-clock time since
-  // that poll, so the real seconds a user spends looking at a row before
-  // pressing a key are not themselves mistaken for pid reuse.
-  function expectedElapsedFor(procRow) {
-    if (!procRow || procRow.elapsed === undefined) return -1
-    var sincePoll = root.procTicksAt > 0 ? (Date.now() - root.procTicksAt) / 1000 : 0
-    return procRow.elapsed + Math.max(0, sincePoll)
-  }
 
   // Signals go through a Process rather than execDetached so a refusal is
   // visible: killing another user's process fails with EPERM, and the row
@@ -495,8 +484,7 @@ Item {
     actionProc.pendingLabel = "kill -" + signal + " " + p
     supersede(actionProc, "actionProc", Model.wrapGuardedCommand(Model.buildGuardedSignalCommand(
       p, "kill -" + signal + " " + String(p),
-      procRow ? procRow.user : "", procRow ? procRow.command : "",
-      root.expectedElapsedFor(procRow)), Model.OUTPUT_CAP_TINY))
+      procRow ? procRow.command : "", procRow ? procRow.starttime : 0), Model.OUTPUT_CAP_TINY))
   }
 
   function reniceProcess(pid, nice, procRow) {
@@ -506,8 +494,7 @@ Item {
     actionProc.pendingLabel = "renice " + nice + " " + p
     supersede(actionProc, "actionProc", Model.wrapGuardedCommand(Model.buildGuardedSignalCommand(
       p, "renice -n " + nice + " -p " + String(p),
-      procRow ? procRow.user : "", procRow ? procRow.command : "",
-      root.expectedElapsedFor(procRow)), Model.OUTPUT_CAP_TINY))
+      procRow ? procRow.command : "", procRow ? procRow.starttime : 0), Model.OUTPUT_CAP_TINY))
   }
 
   function openProcessLsof(pid) {

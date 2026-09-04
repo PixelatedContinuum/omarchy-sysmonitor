@@ -248,7 +248,7 @@ var COLLECT_PROC_SNAPSHOT =
   "printf '%s\\0' /proc/[0-9]*/stat 2>/dev/null | xargs -0 -r cat 2>/dev/null | " +
   "awk '{ n=index($0, \") \"); if (n == 0) next; " +
        "rest = substr($0, n + 2); split(rest, f, \" \"); " +
-       "print $1, f[12], f[13] }'"
+       "print $1, f[12], f[13], f[20] }'"
 
 // ---------------------------------------------------------------- helpers
 
@@ -513,47 +513,60 @@ function userMatches(psUser, currentUser) {
 // force-kill, adds real human time on top of that. If the original process
 // exited in that window the kernel is free to hand its pid to something
 // else entirely, and a signal sent on pid alone would land on whatever that
-// is — not what the user selected. Elapsed time only ever grows for a
-// process that kept running, so a fresh reading that comes back lower than
-// expected is itself evidence of reuse, not measurement noise; a small
-// tolerance absorbs polling/extrapolation rounding without opening the
-// window back up.
+// is — not what the user selected.
 //
-// This is NOT atomic and must not be described as such. Identity is read by
-// one `ps`, and the action is a later exec, so a gap remains between the
-// check and the act; the guard narrows the window, it does not close it.
-// Collapsing what were three separate `ps` invocations into one removed two
-// of the three gaps and halved the guard's latency, but the last one is
-// irreducible in shell — the race-free primitive is pidfd_open(2) plus
-// pidfd_send_signal(2), which has no shell equivalent. What bounds the
-// remaining exposure is that these are unprivileged operations on the user's
-// own processes: the worst outcome is signalling one of your own processes
-// you did not mean to, not a privilege boundary being crossed.
+// The token compared is field 22 of /proc/PID/stat, the process start time in
+// boot-relative clock ticks. That is an IDENTITY, not a quantity: it is fixed
+// for the life of a process and a reused pid gets a different one, so it is
+// compared for exact equality with no tolerance window to size or defend. It
+// replaced an `etimes >= expected - 3s` test, which needed slack precisely
+// because elapsed seconds keep moving, and any slack is a window a reuse can
+// land inside. Tick granularity is also 100x finer than the one-second fields
+// `ps` can report, so a same-second reuse cannot slip through either.
+//
+// Reading it takes one `awk` over one file, which is also why `ps` is gone
+// from this path: `ps` cannot report raw start ticks at all, so keeping it for
+// the username would have meant two reads at two instants to verify one
+// identity. Ownership is not checked here because it is enforced twice over
+// without this: the UI only offers these actions on rows the user owns, and
+// the kernel fails kill/renice against anyone else's process with EPERM.
+//
+// This is NOT atomic and must not be described as such. Identity is read once,
+// the action is a later exec, so a gap remains between the check and the act;
+// the guard narrows the window, it does not close it. The race-free primitive
+// is pidfd_open(2) plus pidfd_send_signal(2), which has no shell equivalent.
+// What bounds the remaining exposure is that these are unprivileged operations
+// on the user's own processes: the worst outcome is signalling one of your own
+// processes you did not mean to, not a privilege boundary being crossed.
 //
 // actionCmd must not itself depend on anything other than the pid/signal/
 // nice-value literals the caller already embedded in it (e.g. "kill -TERM
 // 1234") — this only wraps a guard around it, it does not sanitize it.
-function buildGuardedSignalCommand(pid, actionCmd, expectedUser, expectedComm, expectedElapsed) {
+function buildGuardedSignalCommand(pid, actionCmd, expectedComm, expectedStarttime) {
   var p = _int(pid)
-  var user = String(expectedUser || "")
   var comm = String(expectedComm || "")
-  var elapsed = _num(expectedElapsed)
-  var tolerance = 3 // seconds of slack for polling/extrapolation rounding
-  var floor = Math.max(0, Math.floor(elapsed - tolerance))
-  // Single-quote for POSIX sh; a literal single quote inside a value (rare
-  // in a username or comm, but comm can hold nearly anything) is escaped by
-  // closing the quote, emitting an escaped quote, and reopening it.
+  var start = _int(expectedStarttime)
+  // Single-quote for POSIX sh; a literal single quote inside a value (rare in
+  // a comm, but comm can hold nearly anything) is escaped by closing the
+  // quote, emitting an escaped quote, and reopening it.
   var sq = function(s) { return "'" + s.replace(/'/g, "'\\''") + "'" }
-  // One `ps`, one instant, three fields. `comm` is requested LAST and read
-  // into the trailing variable because it is the only field that can contain
-  // spaces — `read` puts the unsplit remainder there, so a command like
-  // `Fell & Sell.exe` survives intact. Requesting any other space-bearing
-  // field, or putting comm earlier, would corrupt the split.
-  return "read -r u e c <<< \"$(ps -o user:20=,etimes=,comm= -p " + p + " 2>/dev/null)\"; " +
-         "if [ \"$u\" = " + sq(user) + " ] && [ \"$c\" = " + sq(comm) + " ] " +
-         "&& [ -n \"$e\" ] && [ \"$e\" -ge " + floor + " ]; then " +
-         actionCmd + "; " +
-         "else echo " + sq("REFUSED: pid " + p + " no longer matches the selected process") + " >&2; exit 3; fi"
+  var refuse = "echo " + sq("REFUSED: pid " + p + " no longer matches the selected process") +
+               " >&2; exit 3"
+  // A row with no starttime means the tick half of the snapshot was truncated
+  // before this pid, so there is nothing to verify against. Refuse rather than
+  // fall back to a weaker check the caller cannot see.
+  if (start <= 0) return refuse
+  // comm and starttime come out of the SAME line of the SAME file, so there is
+  // no second read to disagree with the first. comm is taken from between the
+  // parens rather than by field index because it can contain spaces or parens
+  // of its own; everything after the last ") " is split positionally, where
+  // original field N is f[N-2], so starttime (22) is f[20].
+  return "read -r s c <<< \"$(awk '{ n = index($0, \") \"); if (n == 0) exit; " +
+         "o = index($0, \"(\"); c = substr($0, o + 1, n - o - 1); " +
+         "rest = substr($0, n + 2); split(rest, f, \" \"); " +
+         "print f[20], c }' /proc/" + p + "/stat 2>/dev/null)\"; " +
+         "if [ \"$s\" = " + sq(String(start)) + " ] && [ \"$c\" = " + sq(comm) + " ]; then " +
+         actionCmd + "; else " + refuse + "; fi"
 }
 
 // ------------------------------------------------- collector process safety
@@ -758,7 +771,7 @@ function parseProcDetailPs(line) {
 // see the ordering note on COLLECT_PROC_SNAPSHOT. A missing marker means the
 // cut landed inside the rows, which is still parsed for whatever survived.
 function parseProcSnapshot(raw) {
-  var out = { ticks: {}, rows: [] }
+  var out = { ticks: {}, starts: {}, rows: [] }
   var parts = String(raw || "").split("@@TICKS")
   var rows = _lines(parts[0])
   for (var j = 0; j < rows.length; j++) {
@@ -773,6 +786,16 @@ function parseProcSnapshot(raw) {
       var pid = _int(f[0])
       if (pid <= 0) continue
       out.ticks[pid] = _int(f[1]) + _int(f[2])
+      // Field 22 of /proc/PID/stat, boot-relative start time in clock ticks.
+      // Carried onto the row below so a signal can be guarded on it: it is an
+      // identity token rather than a quantity, so it is compared exactly and
+      // needs no tolerance window. Absent when the tick half was truncated,
+      // which the guard treats as "cannot verify" rather than "matches".
+      if (f.length > 3) out.starts[pid] = _int(f[3])
+    }
+    for (var k = 0; k < out.rows.length; k++) {
+      var st = out.starts[out.rows[k].pid]
+      if (st !== undefined) out.rows[k].starttime = st
     }
   }
   return out

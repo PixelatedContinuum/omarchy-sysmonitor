@@ -171,17 +171,18 @@ check("a maxLen of 0 or negative still returns a bounded (1-char) string, never 
 
 section("buildGuardedSignalCommand — the identity re-check immediately before a kill/renice actually runs")
 check("returns a string even for garbage input, never throws",
-      typeof M.buildGuardedSignalCommand("not-a-pid", "echo x", "u", "c", "not-a-number") === "string")
+      typeof M.buildGuardedSignalCommand("not-a-pid", "echo x", "c", "not-a-number") === "string")
 
-// A real child process to test against: its pid, comm, and user are fully
-// known, and starting it here means its elapsed time is known too, instead
-// of guessing at a moving target.
+// A real child process to test against: its pid and comm are fully known, and
+// its start time is read from /proc rather than guessed. starttime is an
+// identity token — fixed for the life of the process, different for any reuse
+// of the pid — so every check below is an exact comparison with no tolerance.
 var guardChild = cp.spawn("sleep", ["30"], { stdio: "ignore" })
 var guardPid = guardChild.pid
 var guardUser = (sh("whoami") || "").trim()
 
-function runGuarded(actionCmd, user, comm, elapsed) {
-  var built = M.buildGuardedSignalCommand(guardPid, actionCmd, user, comm, elapsed)
+function runGuarded(actionCmd, comm, starttime) {
+  var built = M.buildGuardedSignalCommand(guardPid, actionCmd, comm, starttime)
   try {
     var out = cp.execSync(built, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
     return { ok: true, stdout: out }
@@ -193,35 +194,43 @@ function runGuarded(actionCmd, user, comm, elapsed) {
 if (!guardPid || !guardUser) {
   skipped("buildGuardedSignalCommand live checks", "could not spawn a test child process or resolve whoami")
 } else {
-  var realEtimes = parseInt((sh("ps -o etimes= -p " + guardPid + " 2>/dev/null") || "0").trim(), 10) || 0
+  var realStart = parseInt((sh("awk '{n=index($0,\") \"); rest=substr($0,n+2); split(rest,f,\" \"); print f[20]}' /proc/"
+                            + guardPid + "/stat 2>/dev/null") || "0").trim(), 10) || 0
+  check("reads a plausible start time for the child out of /proc", realStart > 0, "starttime=" + realStart)
 
-  check("runs the action when user, comm, and elapsed all match",
-        runGuarded("echo GUARD_PASSED", guardUser, "sleep", realEtimes).stdout.indexOf("GUARD_PASSED") >= 0)
+  check("runs the action when comm and start time match exactly",
+        runGuarded("echo GUARD_PASSED", "sleep", realStart).stdout.indexOf("GUARD_PASSED") >= 0)
 
-  check("passes when expected elapsed is within the polling-slack tolerance of the live reading",
-        runGuarded("echo GUARD_PASSED", guardUser, "sleep", realEtimes + 2).stdout.indexOf("GUARD_PASSED") >= 0)
+  // The point of using starttime rather than elapsed seconds: it is compared
+  // exactly, so there is no slack window for a reused pid to land inside. One
+  // tick off is a refusal, where the old elapsed test tolerated three seconds.
+  check("refuses on a start time one tick off — no tolerance window to exploit",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "sleep", realStart + 1)
+                      return !r.ok && r.code === 3 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
 
-  check("refuses when expected elapsed is far beyond tolerance of the live reading (stale/reused pid)",
-        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sleep", realEtimes + 30)
+  check("refuses when the start time is far off (stale or reused pid)",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "sleep", realStart + 100000)
                       return !r.ok && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
 
   check("refuses when the comm no longer matches (simulated pid reuse)",
-        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "totally-different-binary", realEtimes)
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "totally-different-binary", realStart)
                       return !r.ok && r.code === 3 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
 
-  check("refuses when the user no longer matches",
-        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "no-such-user", "sleep", realEtimes)
-                      return !r.ok && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
+  // A row whose snapshot was truncated before its pid carries no start time.
+  // That must refuse rather than silently fall back to a weaker check.
+  check("refuses when no start time is known, rather than degrading the check",
+        (function() { var r = runGuarded("echo SHOULD_NOT_RUN", "sleep", 0)
+                      return !r.ok && r.code === 3 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0 })())
 
   check("shell metacharacters in the expected comm cannot break out of the identity check",
         (function() {
-          var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sleep; echo INJECTED", realEtimes)
+          var r = runGuarded("echo SHOULD_NOT_RUN", "sleep; echo INJECTED", realStart)
           return !r.ok && r.stdout.indexOf("INJECTED") < 0 && r.stdout.indexOf("SHOULD_NOT_RUN") < 0
         })())
 
   check("a single quote in the expected comm produces a clean refusal, not a shell syntax error",
         (function() {
-          var r = runGuarded("echo SHOULD_NOT_RUN", guardUser, "sle'ep", realEtimes)
+          var r = runGuarded("echo SHOULD_NOT_RUN", "sle'ep", realStart)
           return !r.ok && r.code === 3
         })())
 
