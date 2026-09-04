@@ -232,9 +232,65 @@ section("wrapCollectorCommand — process-group isolation and output cap for per
 check("returns a setsid-prefixed argv array shaped for Process.command",
       (function() {
         var cmd = M.wrapCollectorCommand("echo hi", 1000)
-        return Array.isArray(cmd) && cmd[0] === "setsid" && cmd[1] === "--"
-               && cmd[2] === "bash" && cmd[3] === "-c" && typeof cmd[4] === "string"
+        return Array.isArray(cmd) && cmd[0] === "/usr/bin/setsid" && cmd[1] === "--"
+               && cmd[2] === "/usr/bin/bash" && cmd[3] === "-p" && cmd[4] === "-c"
+               && typeof cmd[5] === "string"
       })())
+check("shellCommand never throws on missing/garbage input", (function() {
+  M.shellCommand(null); M.shellCommand(undefined); M.shellCommand(42)
+  return true
+})())
+
+// ---- the hardening, exercised rather than asserted --------------------------
+//
+// Asserting on the argv string only proves the function built what it meant to
+// build. These run each wrapper against a POISONED environment — a fake `ps` and
+// `head` first on PATH, a BASH_ENV injection file, and an exported `ps` shell
+// function — and check what actually executes. They fail if the pin stops
+// working for any reason, including one the string shape cannot see.
+var poison = fs.mkdtempSync("/tmp/sysmon-poison-")
+fs.writeFileSync(poison + "/ps", "#!/bin/sh\necho PWNED-FAKE-PS\n", { mode: 0o755 })
+fs.writeFileSync(poison + "/head", "#!/bin/sh\necho PWNED-FAKE-HEAD\n", { mode: 0o755 })
+fs.writeFileSync(poison + "/evil.sh", "echo PWNED-VIA-BASH_ENV\n")
+
+// Runs an argv array under the poisoned environment and returns its output.
+function runPoisoned(argv, extraEnv) {
+  var env = { PATH: poison + ":/usr/bin:/bin", HOME: process.env.HOME }
+  for (var k in (extraEnv || {})) env[k] = extraEnv[k]
+  try {
+    return cp.execFileSync(argv[0], argv.slice(1),
+      { encoding: "utf8", env: env, stdio: ["ignore", "pipe", "ignore"] }).trim()
+  } catch (e) { return "ERROR" }
+}
+var probe = "ps -o comm= -p 1"
+check("live: a shadowed `ps` on PATH cannot hijack a wrapped collector",
+      runPoisoned(M.wrapCollectorCommand(probe, 4096)) === "systemd",
+      runPoisoned(M.wrapCollectorCommand(probe, 4096)))
+check("live: a shadowed `head` on PATH cannot hijack the output cap",
+      runPoisoned(M.wrapCollectorCommand("echo capped", 4096)) === "capped")
+check("live: a shadowed `ps` cannot hijack shellCommand either",
+      runPoisoned(M.shellCommand(probe)) === "systemd")
+// The control: the same probe WITHOUT the wrapper must be hijacked, otherwise
+// the poison is not actually reaching the shell and the three checks above
+// would pass for the wrong reason.
+check("control: an unwrapped command IS hijacked by the poisoned PATH",
+      runPoisoned(["/usr/bin/bash", "-c", probe]) === "PWNED-FAKE-PS",
+      runPoisoned(["/usr/bin/bash", "-c", probe]))
+check("live: BASH_ENV cannot inject code into a wrapped collector",
+      runPoisoned(M.wrapCollectorCommand("echo clean", 4096),
+                  { BASH_ENV: poison + "/evil.sh" }) === "clean")
+check("live: BASH_ENV cannot inject code into shellCommand",
+      runPoisoned(M.shellCommand("echo clean"),
+                  { BASH_ENV: poison + "/evil.sh" }) === "clean")
+check("live: an exported shell function cannot shadow a command name",
+      (function() {
+        var argv = M.wrapCollectorCommand(probe, 4096)
+        var quoted = argv.map(function(a) { return "'" + String(a).replace(/'/g, "'\\''") + "'" }).join(" ")
+        var out = sh("ps() { echo PWNED-VIA-EXPORTED-FUNCTION; }; export -f ps; " +
+                     "PATH=" + poison + ":/usr/bin:/bin " + quoted)
+        return String(out || "").trim() === "systemd"
+      })())
+try { fs.rmSync(poison, { recursive: true, force: true }) } catch (e) {}
 check("never throws on missing/garbage input", (function() {
   M.wrapCollectorCommand(null, "not-a-number")
   M.wrapCollectorCommand(undefined, undefined)
@@ -349,6 +405,7 @@ check("rows carry elapsed time straight from ps",
       snapA.rows.every(function(r) { return r.elapsed >= 0 }))
 check("a freshly parsed row has no CPU reading yet — undefined, not a misleading 0",
       snapA.rows.every(function(r) { return r.cpu === undefined && r.cpuCore === undefined }))
+
 
 var tA = Date.now()
 var spin2 = Date.now(); while (Date.now() - spin2 < 600) {}
@@ -518,6 +575,81 @@ check("parseNoCpuPsLine rejects a row missing nlwp/etimes",
       M.parseNoCpuPsLine("12 1 root 0.5 Sl 0 2048 app") === null)
 
 // ------------------------------------------------------------------ SMART
+// Deliberately placed AFTER the live CPU sampling block: that block measures
+// a tick delta between two snapshots but only starts its wall clock at the
+// second one, so anything slow sitting between them (the churn test below
+// spawns 60 processes) is charged to the delta and not to the elapsed time,
+// which pushes the computed share past 100%.
+
+// Three ways the snapshot used to lose processes silently, two of them hidden
+// by the 2>/dev/null it needs for ordinary /proc churn.
+check("snapshot never hands the /proc glob to a command as argv",
+      M.COLLECT_PROC_SNAPSHOT.indexOf("printf '%s\\0' /proc/[0-9]*/stat") !== -1
+      && !/awk[^|]*\/proc\/\[0-9\]\*\/stat/.test(M.COLLECT_PROC_SNAPSHOT))
+check("snapshot reads through cat, so a process exiting mid-scan cannot truncate it",
+      M.COLLECT_PROC_SNAPSHOT.indexOf("xargs -0 -r cat") !== -1)
+
+// The whole command is piped through head -c OUTPUT_CAP_XLARGE, so on a busy
+// enough machine the tail is cut. `ps` must therefore come FIRST: losing the
+// tail costs CPU%, losing the head would cost the entire process list, which
+// is what happened while the tick pass led. Asserted on behaviour, not on the
+// command string: a snapshot cut anywhere past the marker still yields rows.
+check("ps section is emitted before the tick section",
+      M.COLLECT_PROC_SNAPSHOT.indexOf("ps -eo") < M.COLLECT_PROC_SNAPSHOT.indexOf("@@TICKS")
+      && M.COLLECT_PROC_SNAPSHOT.indexOf("@@TICKS") < M.COLLECT_PROC_SNAPSHOT.indexOf("printf"))
+var liveSnap = sh(M.COLLECT_PROC_SNAPSHOT)
+var cutAtMarker = M.parseProcSnapshot(liveSnap.slice(0, liveSnap.indexOf("@@TICKS")))
+var cutMidRows = M.parseProcSnapshot(liveSnap.slice(0, Math.floor(liveSnap.indexOf("@@TICKS") / 2)))
+check("a snapshot truncated before the marker still returns the process rows",
+      cutAtMarker.rows.length > 10 && Object.keys(cutAtMarker.ticks).length === 0,
+      cutAtMarker.rows.length + " rows, " + Object.keys(cutAtMarker.ticks).length + " ticks")
+check("a snapshot truncated mid-rows returns the rows that survived, not zero",
+      cutMidRows.rows.length > 5, cutMidRows.rows.length + " rows")
+
+// gawk aborts the WHOLE invocation with a fatal open error when a process
+// exits before it reaches that pid's stat file, dropping every remaining
+// process in the chunk. cat warns and continues, so the read survives churn.
+// Measured on an idle machine, the old form fell from ~516 rows to as low as
+// 358. Exercised for real by spawning short-lived processes underneath it.
+var tickPass = M.COLLECT_PROC_SNAPSHOT.split("echo '@@TICKS'; ")[1]
+
+// Deterministic mechanism check, run against a fixed set of files with one
+// deliberately missing entry in the MIDDLE. This is the bug reduced to its
+// essentials, with no timing, no $RANDOM (a bashism that silently yields 0
+// under dash and would make a churn-based test pass vacuously), and no
+// threshold to tune: awk given the list directly dies at the gap and never
+// reads what follows, while the printf|xargs|cat form reads every survivor.
+var gapDir = fs.mkdtempSync("/tmp/sysmon-gap-")
+for (var gi = 1; gi <= 40; gi++) {
+  fs.writeFileSync(gapDir + "/" + gi + ".stat",
+                   gi + " (proc" + gi + ") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20\n")
+}
+fs.unlinkSync(gapDir + "/20.stat")   // the gap a vanishing process leaves
+// The list must NAME the deleted file — that is the whole point. Generating it
+// from `ls` after the unlink would silently omit the gap and the control would
+// pass for the wrong reason, which is exactly what it did on the first attempt.
+var awkProg = tickPass.slice(tickPass.indexOf("awk '")).trim()
+var fileList = "$(seq 1 40 | sed 's/$/.stat/')"
+var oldForm = sh("cd " + gapDir + " && " + awkProg + " " + fileList + " 2>/dev/null | wc -l")
+var newForm = sh("cd " + gapDir + " && printf '%s\\0' " + fileList + " 2>/dev/null" +
+                 " | xargs -0 -r cat 2>/dev/null | " + awkProg + " | wc -l")
+check("a vanished file makes the old awk-opens-the-glob form drop the rest",
+      parseInt(oldForm || "0", 10) < 39,
+      "old form read " + String(oldForm).trim() + " of 39 surviving files")
+check("the shipped form reads every surviving file past the gap",
+      parseInt(newForm || "0", 10) === 39,
+      "new form read " + String(newForm).trim() + " of 39 surviving files")
+try { fs.rmSync(gapDir, { recursive: true, force: true }) } catch (e) {}
+
+// Corroboration against the real thing. POSIX-safe: no $RANDOM, the churn is
+// created by short-lived subshells that exit at staggered but fixed intervals.
+var churn = sh("i=1; while [ $i -le 60 ]; do ( sleep 0.0$(( i % 9 )) ) & i=$((i+1)); done; " +
+               "N=$(" + tickPass + " | wc -l); wait; echo $N")
+var churnCount = parseInt(churn || "0", 10)
+check("live: tick pass still sees the full process table while processes churn",
+      churnCount > Object.keys(snapA.ticks).length * 0.9,
+      churnCount + " ticks under churn vs " + Object.keys(snapA.ticks).length + " at rest")
+
 section("Disk — live `df`")
 var dfRaw = sh("df -h --output=source,size,used,avail,pcent,target")
 if (!dfRaw) skipped("parseDfOutput", "`df` unavailable")

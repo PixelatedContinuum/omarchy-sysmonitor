@@ -215,12 +215,40 @@ function collectProcDetail(pid) {
 // spaces or parens, so everything is indexed after the LAST ") " rather than
 // by naive whitespace splitting. Once the pid and comm are behind us, original
 // field N is f[N-2]: utime 14→f[12], stime 15→f[13].
+// Two independent reads joined by a marker: the `ps` table that the process
+// list renders from, then the per-pid tick counters that CPU% is derived from.
+//
+// ORDER MATTERS, and it is the reason `ps` goes first. The whole thing is piped
+// through `head -c OUTPUT_CAP_XLARGE`, and at ~96 bytes per process that cap
+// binds at roughly 10,900 processes — well before the ARG_MAX ceiling below.
+// Whichever half is downstream of the cut is the half that gets lost, and
+// losing ticks costs CPU%, which the row model already renders as undefined.
+// Losing the `ps` half instead used to cost the ENTIRE process list, because
+// the marker went with it and parseProcSnapshot found nothing to split on. A
+// process monitor showing no processes is the worst available failure, so the
+// expendable half is the one placed last.
+//
+// Neither the glob nor awk touches argv. Passing /proc/[0-9]*/stat straight to
+// awk builds an argv that exceeds ARG_MAX (~131k paths here); `printf` is a bash
+// builtin, so it absorbs the expanded list with no execve and streams it
+// NUL-separated into xargs, which chunks it. That ceiling is far above the cap,
+// so it is the lesser of the two bounds — kept because it costs nothing.
+//
+// Letting awk open the files itself is the bug that actually bit. A process
+// exiting between the glob expanding and awk reaching its file makes gawk abort
+// the entire invocation with a FATAL open error, dropping every remaining
+// process in that chunk; `2>/dev/null` hid it. Measured on an idle machine,
+// snapshots fell from ~516 processes to as low as 358. `cat` warns and carries
+// on where awk gives up, and awk then sees one concatenated stream, which is
+// safe because each stat file is exactly one newline-terminated line and $1
+// (the pid) comes from the contents rather than the filename.
 var COLLECT_PROC_SNAPSHOT =
+  "ps -eo pid,ppid,user:20,%mem,stat,nice,rss,nlwp,etimes,comm --no-headers 2>/dev/null; " +
+  "echo '@@TICKS'; " +
+  "printf '%s\\0' /proc/[0-9]*/stat 2>/dev/null | xargs -0 -r cat 2>/dev/null | " +
   "awk '{ n=index($0, \") \"); if (n == 0) next; " +
        "rest = substr($0, n + 2); split(rest, f, \" \"); " +
-       "print $1, f[12], f[13] }' /proc/[0-9]*/stat 2>/dev/null; " +
-  "echo '@@PS'; " +
-  "ps -eo pid,ppid,user:20,%mem,stat,nice,rss,nlwp,etimes,comm --no-headers 2>/dev/null"
+       "print $1, f[12], f[13] }'"
 
 // ---------------------------------------------------------------- helpers
 
@@ -489,9 +517,18 @@ function userMatches(psUser, currentUser) {
 // process that kept running, so a fresh reading that comes back lower than
 // expected is itself evidence of reuse, not measurement noise; a small
 // tolerance absorbs polling/extrapolation rounding without opening the
-// window back up. Reading and acting happen inside one `ps` + one shell
-// process, so there is no second gap between the check and the act for a
-// reuse to land in.
+// window back up.
+//
+// This is NOT atomic and must not be described as such. Identity is read by
+// one `ps`, and the action is a later exec, so a gap remains between the
+// check and the act; the guard narrows the window, it does not close it.
+// Collapsing what were three separate `ps` invocations into one removed two
+// of the three gaps and halved the guard's latency, but the last one is
+// irreducible in shell — the race-free primitive is pidfd_open(2) plus
+// pidfd_send_signal(2), which has no shell equivalent. What bounds the
+// remaining exposure is that these are unprivileged operations on the user's
+// own processes: the worst outcome is signalling one of your own processes
+// you did not mean to, not a privilege boundary being crossed.
 //
 // actionCmd must not itself depend on anything other than the pid/signal/
 // nice-value literals the caller already embedded in it (e.g. "kill -TERM
@@ -507,9 +544,12 @@ function buildGuardedSignalCommand(pid, actionCmd, expectedUser, expectedComm, e
   // in a username or comm, but comm can hold nearly anything) is escaped by
   // closing the quote, emitting an escaped quote, and reopening it.
   var sq = function(s) { return "'" + s.replace(/'/g, "'\\''") + "'" }
-  return "u=$(ps -o user:20= -p " + p + " 2>/dev/null | tr -d ' '); " +
-         "c=$(ps -o comm= -p " + p + " 2>/dev/null); " +
-         "e=$(ps -o etimes= -p " + p + " 2>/dev/null | tr -d ' '); " +
+  // One `ps`, one instant, three fields. `comm` is requested LAST and read
+  // into the trailing variable because it is the only field that can contain
+  // spaces — `read` puts the unsplit remainder there, so a command like
+  // `Fell & Sell.exe` survives intact. Requesting any other space-bearing
+  // field, or putting comm earlier, would corrupt the split.
+  return "read -r u e c <<< \"$(ps -o user:20=,etimes=,comm= -p " + p + " 2>/dev/null)\"; " +
          "if [ \"$u\" = " + sq(user) + " ] && [ \"$c\" = " + sq(comm) + " ] " +
          "&& [ -n \"$e\" ] && [ \"$e\" -ge " + floor + " ]; then " +
          actionCmd + "; " +
@@ -539,6 +579,44 @@ var OUTPUT_CAP_MEDIUM = 65536
 var OUTPUT_CAP_LARGE = 262144
 var OUTPUT_CAP_XLARGE = 1048576
 
+// Absolute interpreter paths, plus a fixed PATH for everything a script then
+// calls by name. Resolving `setsid`/`bash`/`head` through the inherited PATH
+// lets any writable directory earlier on it shadow them; exporting SAFE_PATH
+// inside the wrapper extends the same guarantee to `awk`, `ps`, `df`, `free`
+// and the rest, which the collector scripts invoke by bare name. Omarchy is
+// Arch with a merged /usr, so /usr/bin is where these live; /bin trails it
+// only because it costs nothing.
+//
+// PATH is not the only way to put attacker code in front of a bare command
+// name, and pinning it alone would be a half measure. Both remaining channels
+// outrank PATH lookup and both are closed by BASH_OPTS below:
+//
+//   BASH_ENV            non-interactive bash sources it BEFORE the script runs,
+//                       so it is arbitrary code execution rather than mere
+//                       shadowing. `--noprofile --norc` does NOT stop it.
+//   exported functions  an exported `ps()` shadows the name whatever PATH says.
+//
+// `-p` (privileged mode) makes bash skip BASH_ENV/ENV and refuse inherited
+// function definitions, which closes both, and unlike `env -i` it leaves HOME
+// intact — COLLECT_THEME_PALETTE reads a path under it. Verified against both
+// bypasses. LD_PRELOAD and LD_AUDIT remain out of scope by construction: they
+// act on /usr/bin/bash itself before any of its options are parsed, and an
+// attacker who can set them already has code execution as this user, which is
+// the same reason none of this is a privilege boundary.
+var BIN_SETSID = "/usr/bin/setsid"
+var BIN_BASH = "/usr/bin/bash"
+var BIN_HEAD = "/usr/bin/head"
+var BASH_OPTS = "-p"
+var SAFE_PATH = "/usr/bin:/bin"
+
+// Wraps a bare shell script as an argv command carrying the same PATH
+// guarantee, but with no process group and no output cap. For the one-shot,
+// non-periodic commands — process detail, signal guards, group kills — where
+// the collector machinery does not apply but PATH shadowing still would.
+function shellCommand(script) {
+  return [BIN_BASH, BASH_OPTS, "-c", "PATH=" + SAFE_PATH + "; " + String(script || "true")]
+}
+
 // Wraps a collector script as a full argv command: run under `setsid` so
 // the whole pipeline (every stage — awk, cat, ps, whatever the script
 // forks) lands in ONE process group distinct from the plugin's own, and
@@ -552,9 +630,36 @@ var OUTPUT_CAP_XLARGE = 1048576
 // pipeline launched this way puts every stage in a process group distinct
 // from the launching shell's own, confirmed with `ps -o pgid=` before and
 // after — see buildGroupKillCommand for how that group is torn down.
+// `setsid` is deliberately used WITHOUT `-w`. Unwaited, it execs in place from a
+// non-group-leader parent (which is what Quickshell spawns), so the tracked pid
+// is itself the new group leader and buildGroupKillCommand can read its pgid and
+// kill the whole pipeline. With `-w` setsid would linger in the ORIGINAL process
+// group, and that same group kill would take the plugin down with it. Verified:
+// the child's pgid equals its own pid, and exit codes still propagate.
+//
+// Exit status here is head's, which is 0 whether or not the script succeeded.
+// That is fine for a collector, whose output is the only product, and it is
+// deliberately NOT "fixed" with `pipefail`: capping output makes head close the
+// pipe early, the producer takes SIGPIPE, and pipefail would then report every
+// truncated-but-working collector as a failure. Commands whose exit code is
+// load-bearing use wrapGuardedCommand instead.
 function wrapCollectorCommand(script, maxOutputBytes) {
   var n = maxOutputBytes > 0 ? _int(maxOutputBytes) : 65536
-  return ["setsid", "--", "bash", "-c", "( " + String(script || "true") + " ) | head -c " + n]
+  return [BIN_SETSID, "--", BIN_BASH, BASH_OPTS, "-c",
+          "PATH=" + SAFE_PATH + "; ( " + String(script || "true") + " ) | " +
+          BIN_HEAD + " -c " + n]
+}
+
+// Same isolation and cap as wrapCollectorCommand, but the wrapped script's own
+// exit status survives the pipe via PIPESTATUS. For the guarded kill/renice
+// path, where a non-zero status is the REFUSED signal the UI reports and must
+// not be swallowed by head. PIPESTATUS rather than `pipefail` because it reads
+// the producer's status directly instead of folding SIGPIPE into the verdict.
+function wrapGuardedCommand(script, maxOutputBytes) {
+  var n = maxOutputBytes > 0 ? _int(maxOutputBytes) : 65536
+  return [BIN_SETSID, "--", BIN_BASH, BASH_OPTS, "-c",
+          "PATH=" + SAFE_PATH + "; ( " + String(script || "true") + " ) | " +
+          BIN_HEAD + " -c " + n + "; exit ${PIPESTATUS[0]}"]
 }
 
 // Given the tracked {name, startedAt, deadlineMs} for every collector
@@ -647,22 +752,27 @@ function parseProcDetailPs(line) {
 // Thread count and elapsed time travel on the rows themselves now, not a
 // separate meta table keyed off the /proc scan — see the comment above
 // COLLECT_PROC_SNAPSHOT for why that used to race.
+// Rows come from the FIRST section and ticks from the second, matching the
+// order COLLECT_PROC_SNAPSHOT emits them. A truncated read therefore still
+// yields a full row list with some ticks missing, rather than no rows at all;
+// see the ordering note on COLLECT_PROC_SNAPSHOT. A missing marker means the
+// cut landed inside the rows, which is still parsed for whatever survived.
 function parseProcSnapshot(raw) {
   var out = { ticks: {}, rows: [] }
-  var parts = String(raw || "").split("@@PS")
-  var lines = _lines(parts[0])
-  for (var i = 0; i < lines.length; i++) {
-    var f = lines[i].trim().split(/\s+/)
-    if (f.length < 3) continue
-    var pid = _int(f[0])
-    if (pid <= 0) continue
-    out.ticks[pid] = _int(f[1]) + _int(f[2])
+  var parts = String(raw || "").split("@@TICKS")
+  var rows = _lines(parts[0])
+  for (var j = 0; j < rows.length; j++) {
+    var r = parseNoCpuPsLine(rows[j])
+    if (r) out.rows.push(r)
   }
   if (parts.length > 1) {
-    var rows = _lines(parts[1])
-    for (var j = 0; j < rows.length; j++) {
-      var r = parseNoCpuPsLine(rows[j])
-      if (r) out.rows.push(r)
+    var lines = _lines(parts[1])
+    for (var i = 0; i < lines.length; i++) {
+      var f = lines[i].trim().split(/\s+/)
+      if (f.length < 3) continue
+      var pid = _int(f[0])
+      if (pid <= 0) continue
+      out.ticks[pid] = _int(f[1]) + _int(f[2])
     }
   }
   return out
@@ -1149,6 +1259,8 @@ if (typeof module !== "undefined" && module.exports) {
     userMatches: userMatches,
     buildGuardedSignalCommand: buildGuardedSignalCommand,
     wrapCollectorCommand: wrapCollectorCommand,
+    wrapGuardedCommand: wrapGuardedCommand,
+    shellCommand: shellCommand,
     OUTPUT_CAP_TINY: OUTPUT_CAP_TINY,
     OUTPUT_CAP_MEDIUM: OUTPUT_CAP_MEDIUM,
     OUTPUT_CAP_LARGE: OUTPUT_CAP_LARGE,

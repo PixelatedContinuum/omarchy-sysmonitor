@@ -172,7 +172,7 @@ Panel {
       var proc = root.collectorByName(n)
       if (proc) {
         var pid = proc.processId
-        if (pid) Quickshell.execDetached(["bash", "-c", Model.buildGroupKillCommand(pid)])
+        if (pid) Quickshell.execDetached(Model.shellCommand(Model.buildGroupKillCommand(pid)))
         if (proc.running) proc.running = false
       }
       delete collectorStarts[n]
@@ -388,6 +388,11 @@ Panel {
   // door, not a second implementation of opening the panel.
   Process {
     id: openFullProc
+    // Resolved through PATH on purpose, unlike every shell command this plugin
+    // runs (see Model.js BIN_* / SAFE_PATH). omarchy-shell is Omarchy's own
+    // published entry point, every plugin invokes it by name, and pinning a path
+    // would break the day Omarchy relocates it. Same shadowing primitive in
+    // principle; a deliberate exception, not an oversight.
     command: ["omarchy-shell", "shell", "toggle", "jharrison.sysmonitor"]
   }
 

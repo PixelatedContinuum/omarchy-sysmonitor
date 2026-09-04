@@ -415,13 +415,16 @@ Item {
 
   // ─────────────────────────────────────────────── actions
   //
-  // detailProc and procDetailProc below are not periodic collectors: they
-  // fire once here, on selection, not on a recurring timer (detailTick is a
-  // display-only counter that extrapolates elapsed time in the UI between
-  // polls, it never relaunches either process). Neither goes through
-  // wrapCollectorCommand or the watchdog for that reason, matching the
-  // review's own "periodic subprocess collectors" scoping. Model.collectProcDetail
-  // still bounds its own ancestry walk to 8 hops regardless (see Model.js).
+  // detailProc and procDetailProc fire once here on selection rather than on a
+  // recurring timer (detailTick is a display-only counter that extrapolates
+  // elapsed time in the UI between polls; it never relaunches either process).
+  // They still go through wrapCollectorCommand and the watchdog, because being
+  // one-shot bounds how OFTEN one starts and nothing about how long it can hang
+  // or how much it can emit. A `ps` wedged against unresponsive /proc lasts just
+  // as long whether a timer or a mouse click started it.
+  //
+  // Each selection supersedes the last; see supersede() for why that is not a
+  // stop/start pair and why the old process group is torn down first.
   function selectProcess(proc) {
     if (!proc) return
     actionError = ""
@@ -434,11 +437,11 @@ Item {
     selectedProcess = proc
     procDetail = null
     detailTick = 0
-    detailProc.command = ["bash", "-c",
-      "ps -p " + proc.pid + " -o pid,ppid,user:20,%cpu,%mem,stat,nice,rss,args --no-headers"]
-    detailProc.running = true
-    procDetailProc.command = ["bash", "-c", Model.collectProcDetail(proc.pid)]
-    procDetailProc.running = true
+    supersede(detailProc, "detailProc", Model.wrapCollectorCommand(
+      "ps -p " + proc.pid + " -o pid,ppid,user:20,%cpu,%mem,stat,nice,rss,args --no-headers",
+      Model.OUTPUT_CAP_MEDIUM))
+    supersede(procDetailProc, "procDetailProc", Model.wrapCollectorCommand(
+      Model.collectProcDetail(proc.pid), Model.OUTPUT_CAP_MEDIUM))
   }
 
   function backToList() {
@@ -490,11 +493,10 @@ Item {
     if (p <= 0) return
     actionError = ""
     actionProc.pendingLabel = "kill -" + signal + " " + p
-    actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
+    supersede(actionProc, "actionProc", Model.wrapGuardedCommand(Model.buildGuardedSignalCommand(
       p, "kill -" + signal + " " + String(p),
       procRow ? procRow.user : "", procRow ? procRow.command : "",
-      root.expectedElapsedFor(procRow))]
-    actionProc.running = true
+      root.expectedElapsedFor(procRow)), Model.OUTPUT_CAP_TINY))
   }
 
   function reniceProcess(pid, nice, procRow) {
@@ -502,11 +504,10 @@ Item {
     if (p <= 0) return
     actionError = ""
     actionProc.pendingLabel = "renice " + nice + " " + p
-    actionProc.command = ["bash", "-c", Model.buildGuardedSignalCommand(
+    supersede(actionProc, "actionProc", Model.wrapGuardedCommand(Model.buildGuardedSignalCommand(
       p, "renice -n " + nice + " -p " + String(p),
       procRow ? procRow.user : "", procRow ? procRow.command : "",
-      root.expectedElapsedFor(procRow))]
-    actionProc.running = true
+      root.expectedElapsedFor(procRow)), Model.OUTPUT_CAP_TINY))
   }
 
   function openProcessLsof(pid) {
@@ -518,6 +519,11 @@ Item {
     // The only current call site already passes a real integer.
     var p = parseInt(pid, 10) || 0
     if (p <= 0) return
+    // Resolved through PATH on purpose, unlike every shell command this plugin
+    // runs (see Model.js BIN_* / SAFE_PATH). These are Omarchy's own published
+    // entry points, every plugin invokes them by name, and pinning a path would
+    // break the day Omarchy relocates them. Same shadowing primitive in
+    // principle; a deliberate exception, not an oversight.
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
                              "lsof -p " + p])
   }
@@ -621,6 +627,37 @@ Item {
     if (name) collectorStarts[name] = Date.now()
   }
 
+  // Replaces whatever a one-shot Process is doing with a new command. Distinct
+  // from start() because start() is a no-op when the Process is already
+  // running, which is precisely the case here — a second row selected while the
+  // first row's read is still in flight.
+  //
+  // The old pipeline's whole process GROUP is torn down first, exactly as
+  // sweepHungCollectors does it and for the same reason: setsid made the tracked
+  // pid a group leader, so killing that pid alone would strand the stages it
+  // forked (ps, cat, awk, head) as orphans. Superseding without this would leak
+  // one such group per rapid re-selection.
+  //
+  // Killing first is also what makes the fresh timestamp honest. Stamping
+  // collectorStarts while the previous read was still running would restart the
+  // deadline clock for a process that had already been hanging, so a wedged read
+  // could be pushed past the watchdog forever by clicking around it.
+  //
+  // `running = true` rather than a stop/start pair: terminate() is asynchronous
+  // and does not clear the handle, so `running` still reads true on the next
+  // line. Leaving targetRunning set lets Process launch the new command itself
+  // once the old one is reaped.
+  function supersede(proc, name, command) {
+    if (!proc) return
+    var pid = proc.processId
+    if (proc.running && pid) {
+      Quickshell.execDetached(Model.shellCommand(Model.buildGroupKillCommand(pid)))
+    }
+    proc.command = command
+    proc.running = true
+    if (name) collectorStarts[name] = Date.now()
+  }
+
   // Bare `id`s are file-scoped identifiers, not values — there is no QML
   // reflection from "the string name of a collector" back to the Process
   // object it names, so the watchdog (which only has the name, recorded by
@@ -641,6 +678,9 @@ Item {
       case "sensorProc": return sensorProc
       case "fanProc": return fanProc
       case "procProc": return procProc
+      case "detailProc": return detailProc
+      case "procDetailProc": return procDetailProc
+      case "actionProc": return actionProc
       default: return null
     }
   }
@@ -667,7 +707,7 @@ Item {
       // surviving as an orphan after the leader is gone.
       if (proc) {
         var pid = proc.processId
-        if (pid) Quickshell.execDetached(["bash", "-c", Model.buildGroupKillCommand(pid)])
+        if (pid) Quickshell.execDetached(Model.shellCommand(Model.buildGroupKillCommand(pid)))
         if (proc.running) proc.running = false
       }
       delete collectorStarts[n]
